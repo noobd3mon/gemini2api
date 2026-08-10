@@ -56,10 +56,13 @@ DEFAULT_CONFIG = {
     "xsrf_token": None,
     "default_model": "gemini-3.6-flash",
     "log_requests": True,
+    "cookie": None,
+    "sapisid": None,
     "cookie_file": None,
     "proxy": None,
     "api_keys": [],
     "temporary_chats": False,
+    "auto_update_bl": True,
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
@@ -107,8 +110,38 @@ def log(msg: str):
         sys.stderr.flush()
 
 
+def _parse_sapisid(cookie_str: str) -> str:
+    """Extract SAPISID (or its 3P variant) from a raw cookie header string."""
+    pairs = {}
+    for part in cookie_str.split(";"):
+        if "=" in part:
+            key, value = part.split("=", 1)
+            pairs[key.strip()] = value.strip()
+    return pairs.get("SAPISID") or pairs.get("__Secure-3PAPISID") or ""
+
+
+def _cookie_from_string(raw: str) -> tuple:
+    """Parse an inline cookie (env GEMINI_COOKIE). Accepts raw header or JSON."""
+    text = raw.strip().strip('"').strip("'")
+    sapisid = str(CONFIG.get("sapisid") or "").strip()
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+            text = str(data.get("cookie", "")).strip()
+            sapisid = sapisid or str(data.get("sapisid", "")).strip()
+        except ValueError:
+            log("Inline cookie is not valid JSON, treating it as a raw header")
+    if not text:
+        return "", None
+    sapisid = sapisid or _parse_sapisid(text)
+    return text, sapisid or None
+
+
 def load_cookie() -> tuple:
-    """Load cookie from file. Returns (cookie_str, sapisid)."""
+    """Inline cookie (env/config) first, then cookie_file. Returns (cookie_str, sapisid)."""
+    inline = CONFIG.get("cookie")
+    if inline:
+        return _cookie_from_string(str(inline))
     cookie_file = CONFIG.get("cookie_file")
     if not cookie_file:
         return "", None
@@ -156,6 +189,8 @@ def apply_chat_persistence_flags(inner: list) -> None:
 
 def fetch_latest_bl() -> str | None:
     """Fetch the latest gemini_bl from gemini.google.com page."""
+    if not CONFIG.get("auto_update_bl", True):
+        return None
     try:
         req = urllib.request.Request(
             "https://gemini.google.com/app",
@@ -906,6 +941,77 @@ def load_config(path: str):
         log(f"Config loaded: {path}")
 
 
+def apply_env_overrides():
+    """Apply environment variables on top of CONFIG (env wins over config.json)."""
+    def env(*names):
+        for name in names:
+            raw = os.environ.get(name)
+            if raw is not None and raw.strip() != "":
+                return raw.strip()
+        return None
+
+    str_map = {
+        "host": ("HOST", "GEMINI_HOST"),
+        "cookie": ("GEMINI_COOKIE", "COOKIE"),
+        "sapisid": ("GEMINI_SAPISID", "SAPISID"),
+        "cookie_file": ("GEMINI_COOKIE_FILE", "COOKIE_FILE"),
+        "gemini_bl": ("GEMINI_BL", "BL"),
+        "auth_user": ("GEMINI_AUTH_USER", "AUTH_USER"),
+        "xsrf_token": ("GEMINI_XSRF_TOKEN", "XSRF_TOKEN"),
+        "default_model": ("GEMINI_DEFAULT_MODEL", "DEFAULT_MODEL"),
+        "proxy": ("GEMINI_PROXY", "PROXY"),
+    }
+    int_map = {
+        "port": ("PORT", "GEMINI_PORT"),
+        "retry_attempts": ("RETRY_ATTEMPTS",),
+        "retry_delay_sec": ("RETRY_DELAY_SEC",),
+        "request_timeout_sec": ("REQUEST_TIMEOUT_SEC",),
+    }
+    bool_map = {
+        "log_requests": ("LOG_REQUESTS",),
+        "temporary_chats": ("TEMPORARY_CHATS",),
+        "auto_update_bl": ("AUTO_UPDATE_BL",),
+    }
+
+    for key, names in str_map.items():
+        value = env(*names)
+        if value is not None:
+            CONFIG[key] = value
+
+    for key, names in int_map.items():
+        value = env(*names)
+        if value is not None:
+            try:
+                CONFIG[key] = int(value)
+            except ValueError:
+                log(f"Invalid integer for {key}: {value}")
+
+    for key, names in bool_map.items():
+        value = env(*names)
+        if value is not None:
+            low = value.lower()
+            if low in ("1", "true", "yes", "on", "y"):
+                CONFIG[key] = True
+            elif low in ("0", "false", "no", "off", "n"):
+                CONFIG[key] = False
+
+    keys = env("API_KEYS", "API_KEY", "GEMINI_API_KEYS")
+    if keys is not None:
+        parsed = None
+        if keys.startswith("["):
+            try:
+                parsed = [str(k).strip() for k in json.loads(keys) if str(k).strip()]
+            except ValueError:
+                parsed = None
+        if parsed is None:
+            for sep in ("\n", " ", ";"):
+                keys = keys.replace(sep, ",")
+            parsed = [k.strip() for k in keys.split(",") if k.strip()]
+        CONFIG["api_keys"] = parsed
+
+    return CONFIG
+
+
 def main():
     parser = argparse.ArgumentParser(description="Gemini Web to OpenAI API")
     parser.add_argument("--port", type=int, default=None)
@@ -922,6 +1028,7 @@ def main():
                 config_path = p
                 break
     load_config(config_path)
+    apply_env_overrides()
 
     if args.port:
         CONFIG["port"] = args.port
@@ -944,7 +1051,15 @@ def main():
     print(f"  Listening: http://0.0.0.0:{port}")
     print(f"  Base URL:  http://localhost:{port}/v1")
     print(f"  Models:    {', '.join(MODELS.keys())}")
-    print(f"  Cookie:    {'yes (' + CONFIG['cookie_file'] + ')' if CONFIG.get('cookie_file') else 'none (anonymous)'}")
+    if CONFIG.get("cookie"):
+        cookie_src = "env GEMINI_COOKIE"
+    elif CONFIG.get("cookie_file"):
+        cookie_src = f"file {CONFIG['cookie_file']}"
+    else:
+        cookie_src = "none (anonymous)"
+    print(f"  Config:    {config_path or 'env vars only'}")
+    print(f"  Cookie:    {cookie_src}")
+    print(f"  API keys:  {len(CONFIG.get('api_keys') or [])} configured")
     print(f"  Proxy:     {CONFIG.get('proxy') or 'none (uses system env HTTP_PROXY/HTTPS_PROXY)'}")
     print(f"  Retry:     {CONFIG['retry_attempts']}x / {CONFIG['retry_delay_sec']}s")
     print(f"  BL:        {CONFIG['gemini_bl']}")

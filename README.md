@@ -180,28 +180,69 @@ Create `config.json` in the same directory:
 
 When `api_keys` is `[]`, authentication is disabled. When one or more keys are set, `/v1/*` endpoints require `Authorization: Bearer <key>` or `x-api-key: <key>`.
 
+The file is optional: every key can be supplied as an environment variable instead (see [Deploy to Railway](#deploy-to-railway)), and env values override the file.
+
+## Deploy to Railway
+
+Everything is configured with environment variables - no `config.json`, no volume mount.
+
+1. Push this repo to GitHub, then in Railway: **New Project > Deploy from GitHub repo**.
+2. `railway.json` is picked up automatically: Dockerfile build, region `asia-southeast1-eqsg3a`, 1 replica, health check on `/`.
+3. Add variables in **Variables > Raw Editor** (see `.env.example`):
+
+```bash
+GEMINI_COOKIE=__Secure-1PSID=xxx; __Secure-1PSIDTS=xxx; SAPISID=xxx
+API_KEYS=sk-your-key
+```
+
+4. **Settings > Networking > Generate Domain**, then point your client at `https://<app>.up.railway.app/v1`.
+
+Notes:
+
+- `PORT` is injected by Railway - do not set it manually. The server binds `HOST=0.0.0.0` and that `PORT`.
+- `GEMINI_COOKIE` wins over `cookie_file`. Paste the whole `Cookie` header on one line; surrounding quotes are stripped. A JSON value like `{"cookie": "...", "sapisid": "..."}` also works.
+- `SAPISID` is parsed from the cookie automatically; set `GEMINI_SAPISID` only when it is missing.
+- Rotating the cookie = edit the variable and redeploy. No rebuild of the image is required.
+
+### Environment variables
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `GEMINI_COOKIE` | empty | Full cookie header from gemini.google.com (empty = anonymous mode) |
+| `GEMINI_SAPISID` | parsed from cookie | Override SAPISID when it is not part of the cookie |
+| `API_KEYS` | empty | Client keys: comma separated or JSON array (empty = no auth) |
+| `PORT` / `HOST` | `8081` / `0.0.0.0` | Listen address (Railway sets `PORT`) |
+| `DEFAULT_MODEL` | `gemini-3.6-flash` | Model used when the request does not specify one |
+| `AUTO_UPDATE_BL` | `true` | Fetch the latest `bl` build id on startup |
+| `TEMPORARY_CHATS` | `false` | Do not persist conversations in Gemini Web |
+| `LOG_REQUESTS` | `true` | Request logging |
+| `RETRY_ATTEMPTS` / `RETRY_DELAY_SEC` / `REQUEST_TIMEOUT_SEC` | `3` / `2` / `180` | Retry and timeout tuning |
+| `GEMINI_BL`, `AUTH_USER`, `XSRF_TOKEN`, `PROXY`, `GEMINI_COOKIE_FILE` | empty | Advanced overrides |
+
+Precedence: defaults < `config.json` (optional) < environment variables < CLI flags.
+
 ## Docker
 
 ```bash
-cp config.example.json config.json
+cp .env.example .env   # then fill in GEMINI_COOKIE / API_KEYS
 docker build -t gemini-web2api .
-docker run -d --name gemini-web2api -p 8081:8081 -v ./config.json:/app/config.json gemini-web2api
+docker run -d --name gemini-web2api -p 8081:8081 --env-file .env gemini-web2api
 ```
 
 Or use Docker Compose:
 
 ```bash
-cp config.example.json config.json
+cp .env.example .env   # then fill in GEMINI_COOKIE / API_KEYS
 docker compose up -d
 ```
 
-To mount a cookie file:
+Or pass variables inline instead of using `.env`:
 
 ```bash
-docker run -d --name gemini-web2api -p 8081:8081 -v ./config.json:/app/config.json -v ./cookie.txt:/app/cookie.txt gemini-web2api
+docker run -d --name gemini-web2api -p 8081:8081 -e GEMINI_COOKIE="__Secure-1PSID=xxx; SAPISID=xxx" -e API_KEYS=sk-your-key gemini-web2api
 ```
 
-Set `"cookie_file": "/app/cookie.txt"` in `config.json`.
+Any variable listed in `.env.example` can be passed with `-e`. A mounted cookie file still works through `GEMINI_COOKIE_FILE=/app/cookie.txt`.
 
 > **Note**: If you get empty responses (`content: null`) with Docker's default bridge network, switch to host networking: `docker run --network host ...` or add `network_mode: host` in your compose file. This is caused by Gemini's upstream rejecting requests from certain Docker NAT IP ranges.
 

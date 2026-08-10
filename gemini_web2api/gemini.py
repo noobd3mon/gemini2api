@@ -45,8 +45,38 @@ def _get_httpx_client():
     return _httpx_client
 
 
+def _parse_sapisid(cookie_str: str) -> str:
+    """Extract SAPISID (or its 3P variant) from a raw cookie header string."""
+    pairs = {}
+    for part in cookie_str.split(";"):
+        if "=" in part:
+            key, value = part.split("=", 1)
+            pairs[key.strip()] = value.strip()
+    return pairs.get("SAPISID") or pairs.get("__Secure-3PAPISID") or ""
+
+
+def _cookie_from_string(raw: str) -> tuple:
+    """Parse an inline cookie (env GEMINI_COOKIE). Accepts raw header or JSON."""
+    text = raw.strip().strip('"').strip("'")
+    sapisid = str(CONFIG.get("sapisid") or "").strip()
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+            text = str(data.get("cookie", "")).strip()
+            sapisid = sapisid or str(data.get("sapisid", "")).strip()
+        except ValueError:
+            log("Inline cookie is not valid JSON, treating it as a raw header")
+    if not text:
+        return "", None
+    sapisid = sapisid or _parse_sapisid(text)
+    return text, sapisid or None
+
+
 def load_cookie() -> tuple:
-    """Load cookie from file with mtime-based caching."""
+    """Inline cookie (env/config) first, then cookie_file with mtime caching."""
+    inline = CONFIG.get("cookie")
+    if inline:
+        return _cookie_from_string(str(inline))
     cookie_file = CONFIG.get("cookie_file")
     if not cookie_file or not os.path.exists(cookie_file):
         return "", None
