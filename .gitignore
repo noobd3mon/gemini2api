@@ -7,4 +7,5 @@ cookie.json
 .idea
 .DS_Store
 gemini-auth.json
+capture-*.md
 .mcp-backups/

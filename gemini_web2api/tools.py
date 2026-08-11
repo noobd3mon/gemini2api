@@ -4,8 +4,99 @@ import re
 import uuid
 import base64
 import io
+import urllib.parse
+import mimetypes
 
 MAX_IMAGE_B64_SIZE = 50000  # ~37KB raw image
+
+# Gemini silently truncates very long prompts; keep the tools block bounded.
+PROMPT_MAX_BYTES = 60000
+
+
+def _log(msg: str) -> None:
+    try:
+        from .gemini import log
+        log(msg)
+    except Exception:
+        pass
+
+
+def _decode_data_url(url: str):
+    """Return (bytes, mime) for a data: URL."""
+    header, _sep, payload = url.partition(",")
+    mime = header[5:].split(";")[0].strip() or "application/octet-stream"
+    if ";base64" in header:
+        try:
+            return base64.b64decode(payload), mime
+        except Exception as e:
+            _log(f"Invalid base64 data URL: {e}")
+            return b"", mime
+    return urllib.parse.unquote_to_bytes(payload), mime
+
+
+def _attachment_from_url(url, filename: str = ""):
+    """Build a (data_or_url, mime, filename) attachment tuple from a URL."""
+    if isinstance(url, dict):
+        url = url.get("url", "")
+    if not isinstance(url, str) or not url:
+        return None
+    if url.startswith("data:"):
+        data, mime = _decode_data_url(url)
+        if not data:
+            return None
+        return (data, mime, filename or "")
+    if url.startswith("http://") or url.startswith("https://"):
+        name = filename or urllib.parse.urlparse(url).path.rsplit("/", 1)[-1]
+        return (url, "", name)
+    return None
+
+
+def extract_attachment(part: dict):
+    """Extract an attachment from an OpenAI / Responses / Anthropic content part.
+
+    Returns (data_or_url, mime, filename) or None. `data_or_url` is raw bytes for
+    inline payloads, or a URL string that is fetched right before upload.
+    """
+    if not isinstance(part, dict):
+        return None
+    ptype = part.get("type", "")
+    filename = part.get("filename") or part.get("name") or ""
+    if ptype in ("image_url", "image", "input_image"):
+        src = part.get("source")
+        if isinstance(src, dict) and src.get("data"):  # Anthropic style
+            mime = src.get("media_type") or "image/png"
+            try:
+                return (base64.b64decode(src["data"]), mime, filename)
+            except Exception:
+                return None
+        url = part.get("image_url") or part.get("url") or part.get("image") or ""
+        if not url and isinstance(src, dict):
+            url = src.get("url", "")
+        return _attachment_from_url(url, filename)
+    if ptype in ("file", "input_file", "document"):
+        f = part.get("file") if isinstance(part.get("file"), dict) else part
+        filename = f.get("filename") or f.get("name") or filename
+        src = f.get("source")
+        if isinstance(src, dict) and src.get("data"):
+            mime = src.get("media_type") or "application/octet-stream"
+            try:
+                return (base64.b64decode(src["data"]), mime, filename)
+            except Exception:
+                return None
+        raw = f.get("file_data") or f.get("data") or ""
+        if isinstance(raw, str) and raw and not raw.startswith(("data:", "http://", "https://")):
+            # Raw base64 payload (OpenAI Responses / Anthropic style)
+            mime = (f.get("media_type") or mimetypes.guess_type(filename or "")[0]
+                    or "application/octet-stream")
+            try:
+                return (base64.b64decode(raw), mime, filename)
+            except Exception:
+                return None
+        url = raw or f.get("file_url") or f.get("url") or ""
+        if not url and isinstance(src, dict):
+            url = src.get("url", "")
+        return _attachment_from_url(url, filename)
+    return None
 
 
 def _compress_b64_if_needed(b64: str) -> str:
@@ -69,13 +160,21 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
                 "parameters": fn.get("parameters", tool.get("parameters", {})),
             })
         if tool_defs:
+            tools_json = json.dumps(tool_defs, indent=2)
+            # Large tool lists silently blow the prompt budget: keep names and
+            # descriptions but drop JSON schemas instead of truncating the prompt.
+            if len(tools_json) > PROMPT_MAX_BYTES // 2:
+                slim = [{"name": t.get("name", ""), "description": t.get("description", "")}
+                        for t in tool_defs]
+                tools_json = json.dumps(slim, indent=2)
+                _log(f"Tools block too large ({len(tool_defs)} tools), stripped parameters")
             constraint = _build_tool_choice_instruction(tool_choice, tool_defs)
             parts.append(
                 "# Tool Use\n\n"
                 "You can call the following tools. Call format:\n"
                 '```tool_call\n{"name": "func_name", "arguments": {...}}\n```\n'
                 "When calling tools, output ONLY the tool_call block(s).\n\n"
-                f"Available tools:\n{json.dumps(tool_defs, indent=2)}"
+                f"Available tools:\n{tools_json}"
                 f"{constraint}"
             )
 
@@ -86,13 +185,20 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
         if isinstance(content, list):
             text_parts = []
             for c in content:
-                if c.get("type") in ("text", "input_text"):
+                if isinstance(c, str):
+                    text_parts.append(c)
+                    continue
+                if not isinstance(c, dict):
+                    continue
+                if c.get("type") in ("text", "input_text", "output_text"):
                     text_parts.append(c.get("text", ""))
-                elif c.get("type") == "image_url":
-                    text_parts.append("[Note: Image input not supported in this API. Please describe the image in text.]")
-                elif c.get("type") == "image":
-                    text_parts.append("[Note: Image input not supported in this API. Please describe the image in text.]")
-            content = " ".join(text_parts)
+                    continue
+                att = extract_attachment(c)
+                if att:
+                    images.append(att)
+                    if not (att[1] or "").startswith("image/"):
+                        text_parts.append(f"[Attached file: {att[2] or 'attachment'}]")
+            content = " ".join(p for p in text_parts if p)
 
         if role == "system":
             parts.append(f"[System instruction]: {content}")
@@ -149,6 +255,11 @@ def parse_tool_calls(text: str) -> tuple:
 def build_tool_prompt(tool_defs: list) -> str:
     """Build natural tool-use prompt for Gemini Web that avoids prompt-injection detection."""
     tool_spec = json.dumps(tool_defs, indent=2, ensure_ascii=False)
+    if len(tool_spec) > PROMPT_MAX_BYTES // 2:
+        slim = [{"name": t.get("name", ""), "description": t.get("description", "")}
+                for t in tool_defs]
+        tool_spec = json.dumps(slim, indent=2, ensure_ascii=False)
+        _log(f"Tools block too large ({len(tool_defs)} tools), stripped parameters")
     return (
         "# Tool Use\n\n"
         "You can call the following tools to help accomplish tasks. "
@@ -226,8 +337,22 @@ def google_contents_to_prompt(req: dict) -> tuple:
                 msg_parts.append(p["text"])
             elif p.get("inlineData"):
                 data = p["inlineData"]
-                mime = data.get("mimeType", "image/png")
-                images.append((base64.b64decode(data["data"]), mime))
+                mime = data.get("mimeType") or "application/octet-stream"
+                name = data.get("displayName") or data.get("fileName") or ""
+                try:
+                    images.append((base64.b64decode(data.get("data", "")), mime, name))
+                    if not mime.startswith("image/"):
+                        msg_parts.append(f"[Attached file: {name or mime}]")
+                except Exception as e:
+                    _log(f"Invalid inlineData payload: {e}")
+            elif p.get("fileData"):
+                fd = p["fileData"]
+                uri = fd.get("fileUri") or fd.get("file_uri") or ""
+                att = _attachment_from_url(uri, fd.get("displayName", ""))
+                if att:
+                    images.append(att)
+                    if not (fd.get("mimeType") or "").startswith("image/"):
+                        msg_parts.append(f"[Attached file: {att[2] or uri}]")
             elif p.get("functionCall"):
                 fc = p["functionCall"]
                 msg_parts.append(

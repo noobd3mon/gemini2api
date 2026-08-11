@@ -134,13 +134,40 @@ def _build_headers() -> dict:
     return headers
 
 
+def _build_file_bindings(file_refs: list) -> list:
+    """Bind uploaded files into payload slot inner[0][3].
+
+    Verified against a real gemini.google.com capture (2026-08-11):
+        [[[<file_ref>, 1, None, <mime>], <filename>], ...]
+    Accepts bare refs or (ref, filename, mime) tuples.
+    """
+    if not file_refs:
+        return None
+    bindings = []
+    for i, item in enumerate(file_refs):
+        if isinstance(item, (list, tuple)):
+            parts = list(item) + [None] * (3 - len(item))
+            ref, filename, mime = parts[0], parts[1], parts[2]
+        else:
+            ref, filename, mime = item, None, None
+        if not ref:
+            continue
+        bindings.append([[ref, 1, None, mime or None], filename or f"file_{i}"])
+    return bindings or None
+
+
+def _apply_chat_persistence_flags(inner: list) -> None:
+    """Apply Gemini Web chat persistence flags (temporary chats when enabled)."""
+    if CONFIG.get("temporary_chats", False):
+        inner[41] = [1]
+        inner[45] = 1
+    else:
+        inner[41] = [2]
+
+
 def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
     inner = [None] * 102
-    if file_refs:
-        refs = [[None, None, ref] for ref in file_refs]
-        inner[0] = [prompt, 0, None, refs, None, None, 0]
-    else:
-        inner[0] = [prompt, 0, None, None, None, None, 0]
+    inner[0] = [prompt, 0, None, _build_file_bindings(file_refs), None, None, 0]
     inner[1] = ["en"]
     inner[2] = ["", "", "", None, None, None, None, None, None, ""]
     inner[6] = [0]
@@ -151,7 +178,7 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
     inner[18] = 0
     inner[27] = 1
     inner[30] = [4]
-    inner[41] = [2]
+    _apply_chat_persistence_flags(inner)
     inner[53] = 0
     inner[59] = str(uuid.uuid4())
     inner[61] = []

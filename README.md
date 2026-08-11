@@ -287,7 +287,7 @@ resp = client.chat.completions.create(
 
 ## Limitations
 
-- **No image/multimodal input**: Gemini's image upload requires a proprietary streaming RPC protocol (WIZ/ProcessFile) that cannot be replicated in a standard HTTP proxy. Image inputs in messages will be ignored with a note.
+- **Image/file input**: supported. `image_url`, `input_image`, `input_file` / `file` parts (data URL, raw base64 or http(s) URL) and Google `inlineData` / `fileData` are uploaded to Gemini's resumable upload endpoint and attached to the prompt. Max 20 MB per file, and a valid `GEMINI_COOKIE` is required - without cookies the upload fails and only the text is sent.
 - **Not real Pro/Ultra**: Without a paid subscription cookie, `gemini-3.1-pro` routes to the same Flash model. The "Pro" label is a UI preference, not a backend model switch.
 - **Single-turn only**: Each request is an independent conversation. Multi-turn context is simulated by including previous messages in the prompt.
 - **Rate limits**: Google may throttle high-frequency requests. The server retries automatically but sustained heavy use may be blocked.
