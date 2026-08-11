@@ -35,6 +35,7 @@ import base64
 import mimetypes
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     import httpx
@@ -560,21 +561,37 @@ def prepare_attachment(item, index: int = 0):
     return data, filename or guess_filename(mime, index), mime
 
 
+def upload_one_attachment(index: int, item):
+    """Prepare and upload a single attachment. Returns None when it fails."""
+    try:
+        prepared = prepare_attachment(item, index)
+        if not prepared:
+            return None
+        data, filename, mime = prepared
+        return (upload_file(data, filename, mime), filename, mime)
+    except Exception as e:
+        log(f"Attachment upload failed: {e}")
+        return None
+
+
 def upload_attachments(attachments: list):
-    """Upload attachments; returns [(file_ref, filename, mime), ...] or None."""
+    """Upload attachments; returns [(file_ref, filename, mime), ...] or None.
+
+    Several attachments go up concurrently, the way the web client fires its
+    start requests; the result keeps attachment order because Gemini reads the
+    payload bindings in that order.
+    """
     if not attachments:
         return None
-    refs = []
-    for i, item in enumerate(attachments):
-        try:
-            prepared = prepare_attachment(item, i)
-            if not prepared:
-                continue
-            data, filename, mime = prepared
-            refs.append((upload_file(data, filename, mime), filename, mime))
-        except Exception as e:
-            log(f"Attachment upload failed: {e}")
-    return refs or None
+    if len(attachments) == 1:
+        results = [upload_one_attachment(0, attachments[0])]
+    else:
+        # Warm the shared token cache once so the workers do not all scrape the app page.
+        get_page_tokens()
+        with ThreadPoolExecutor(max_workers=min(4, len(attachments))) as pool:
+            results = list(pool.map(lambda pair: upload_one_attachment(*pair),
+                                    enumerate(attachments)))
+    return [r for r in results if r] or None
 
 
 def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, file_refs: list = None):

@@ -50,7 +50,10 @@ Precedence: `DEFAULT_CONFIG` < `config.json` (optional) < environment variables 
     (`"qKIAYe"`, `"Ylro7b"`, 10-minute cache) and fall back to the constants captured in
     `Capture mẫu/capture-gemini.google.com-*.md` (gitignored - captures contain cookies).
     A 3-file capture reused one `push-id` / `pctx` for all three uploads and fired them
-    concurrently, so parallel uploads are safe.
+    concurrently, so `_upload_attachments` (package) / `upload_attachments` (single file)
+    upload through a `ThreadPoolExecutor`: max 4 workers, token cache warmed once before the
+    pool starts, single attachment stays on the direct path, failures are skipped and the
+    result keeps attachment order.
 - The reference is bound into the chat payload at `inner[0][3]`:
   `[[[<file_ref>, <kind>, null, <mime>], <filename>], ...]`
   (`_build_file_bindings` in the package, `build_file_bindings` in the single file).

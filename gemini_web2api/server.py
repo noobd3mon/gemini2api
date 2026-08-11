@@ -5,12 +5,13 @@ import uuid
 import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
+from concurrent.futures import ThreadPoolExecutor
 
 from .config import CONFIG
 from .models import MODELS, resolve_model
 from .gemini import generate, generate_stream, log
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
-from .multimodal import upload_file, prepare_attachment
+from .multimodal import upload_file, prepare_attachment, _cached_page_tokens
 from . import __version__
 
 
@@ -20,24 +21,39 @@ def _usage(prompt: str, text: str) -> dict:
     return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}
 
 
+def _upload_one(index: int, item):
+    """Prepare and upload a single attachment. Returns None when it fails."""
+    try:
+        prepared = prepare_attachment(item, index)
+        if not prepared:
+            return None
+        data, filename, mime = prepared
+        return (upload_file(data, filename, mime), filename, mime)
+    except Exception as e:
+        log(f"Attachment upload failed: {e}")
+        return None
+
+
 def _upload_attachments(attachments: list) -> list:
     """Upload images/files, returning [(file_ref, filename, mime), ...] or None.
 
     Accepts the (data_or_url, mime, filename) tuples produced by the prompt
     converters; remote URLs are fetched and data: URLs decoded before upload.
+    Several attachments are uploaded concurrently, the way the web client fires
+    its start requests; the result keeps attachment order because Gemini reads
+    the payload bindings in that order.
     """
     if not attachments:
         return None
-    file_refs = []
-    for i, item in enumerate(attachments):
-        try:
-            prepared = prepare_attachment(item, i)
-            if not prepared:
-                continue
-            data, filename, mime = prepared
-            file_refs.append((upload_file(data, filename, mime), filename, mime))
-        except Exception as e:
-            log(f"Attachment upload failed: {e}")
+    if len(attachments) == 1:
+        results = [_upload_one(0, attachments[0])]
+    else:
+        # Warm the shared token cache once so the workers do not all scrape the app page.
+        _cached_page_tokens()
+        with ThreadPoolExecutor(max_workers=min(4, len(attachments))) as pool:
+            results = list(pool.map(lambda pair: _upload_one(*pair),
+                                    enumerate(attachments)))
+    file_refs = [r for r in results if r]
     return file_refs or None
 
 
