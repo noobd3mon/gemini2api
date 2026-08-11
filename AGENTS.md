@@ -40,16 +40,23 @@ Precedence: `DEFAULT_CONFIG` < `config.json` (optional) < environment variables 
   - Start: `x-goog-upload-command: start`, `x-goog-upload-protocol: resumable`,
     `x-goog-upload-header-content-length: <bytes>`, body `urlencode({"File name: <name>": ""})`.
     The session URL comes back in the `x-goog-upload-url` response header.
+    The browser sends **no** `x-goog-upload-header-content-type` - the mime type only travels in
+    the payload binding, so do not add that header back.
   - Finalize: `x-goog-upload-command: upload, finalize`, `x-goog-upload-offset: 0`,
-    `Content-Type: <mime>`, body = raw bytes. The response body **is** the file reference
-    (`/contrib_service/ttl_1d/...`).
+    `Content-Type: application/x-www-form-urlencoded;charset=utf-8` (not the file mime),
+    body = raw bytes. The response body **is** the file reference (`/contrib_service/ttl_1d/...`).
   - Required headers: `push-id`, `x-client-pctx`, `x-tenant-id: bard-storage`, cookie,
     `referer: https://gemini.google.com/`. `push-id` / `pctx` are scraped from the app page
     (`"qKIAYe"`, `"Ylro7b"`, 10-minute cache) and fall back to the constants captured in
-    `capture-gemini.google.com-*.md`.
+    `Capture mẫu/capture-gemini.google.com-*.md` (gitignored - captures contain cookies).
+    A 3-file capture reused one `push-id` / `pctx` for all three uploads and fired them
+    concurrently, so parallel uploads are safe.
 - The reference is bound into the chat payload at `inner[0][3]`:
-  `[[[<file_ref>, 1, null, <mime>], <filename>], ...]`
+  `[[[<file_ref>, <kind>, null, <mime>], <filename>], ...]`
   (`_build_file_bindings` in the package, `build_file_bindings` in the single file).
+  `<kind>` is `1` for images and `3` for every other type (capture: image/png and image/jpeg
+  -> `1`, text/plain -> `3`). Several files are just more entries in the same list, in
+  attachment order.
 - `MAX_UPLOAD_BYTES` is 20 MB. Non-image attachments also add an `[Attached file: <name>]` prompt line.
 - Accepted input shapes: `image_url`, `input_image`, `image`, `file`, `input_file`, `document`,
   Anthropic `source.data`, and Google `inlineData` / `fileData`. Values may be data URLs, raw base64

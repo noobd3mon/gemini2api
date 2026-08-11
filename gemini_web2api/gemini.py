@@ -8,6 +8,7 @@ import urllib.parse
 import ssl
 import os
 import hashlib
+import mimetypes
 
 try:
     import httpx
@@ -137,8 +138,10 @@ def _build_headers() -> dict:
 def _build_file_bindings(file_refs: list) -> list:
     """Bind uploaded files into payload slot inner[0][3].
 
-    Verified against a real gemini.google.com capture (2026-08-11):
-        [[[<file_ref>, 1, None, <mime>], <filename>], ...]
+    Verified against real gemini.google.com captures (2026-08-11):
+        [[[<file_ref>, <kind>, None, <mime>], <filename>], ...]
+    <kind> is 1 for images and 3 for any other file type: a 3-file capture sent
+    1 for image/png and image/jpeg, but 3 for text/plain.
     Accepts bare refs or (ref, filename, mime) tuples.
     """
     if not file_refs:
@@ -152,7 +155,11 @@ def _build_file_bindings(file_refs: list) -> list:
             ref, filename, mime = item, None, None
         if not ref:
             continue
-        bindings.append([[ref, 1, None, mime or None], filename or f"file_{i}"])
+        if not mime and filename:
+            mime = mimetypes.guess_type(filename)[0]
+        mime = mime or "application/octet-stream"
+        kind = 1 if mime.startswith("image/") else 3
+        bindings.append([[ref, kind, None, mime], filename or f"file_{i}"])
     return bindings or None
 
 

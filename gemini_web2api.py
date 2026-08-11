@@ -358,7 +358,8 @@ def upload_file(data: bytes, filename: str = None, mime_type: str = None) -> str
             finish_headers = dict(base_headers)
             finish_headers["X-Goog-Upload-Command"] = "upload, finalize"
             finish_headers["X-Goog-Upload-Offset"] = "0"
-            finish_headers["Content-Type"] = mime
+            # Capture shows the browser finalizes as a form post, not as the file mime.
+            finish_headers["Content-Type"] = "application/x-www-form-urlencoded;charset=utf-8"
             resp2 = _upload_open(urllib.request.Request(upload_url, data=data, headers=finish_headers), 120)
             file_ref = resp2.read().decode("utf-8", errors="replace").strip()
             if not file_ref:
@@ -372,7 +373,11 @@ def upload_file(data: bytes, filename: str = None, mime_type: str = None) -> str
 
 
 def build_file_bindings(file_refs: list) -> list:
-    """inner[0][3] format: [[[<ref>, 1, None, <mime>], <filename>], ...]"""
+    """inner[0][3] format: [[[<ref>, <kind>, None, <mime>], <filename>], ...]
+
+    <kind> is 1 for images and 3 for any other file type: a real 3-file capture
+    sent 1 for image/png and image/jpeg, but 3 for text/plain.
+    """
     if not file_refs:
         return None
     bindings = []
@@ -385,7 +390,11 @@ def build_file_bindings(file_refs: list) -> list:
             ref, filename, mime = entry, "", ""
         if not ref:
             continue
-        bindings.append([[ref, 1, None, mime or "image/jpeg"], filename or guess_filename(mime)])
+        if not mime and filename:
+            mime = mimetypes.guess_type(filename)[0] or ""
+        mime = mime or "application/octet-stream"
+        kind = 1 if mime.startswith("image/") else 3
+        bindings.append([[ref, kind, None, mime], filename or guess_filename(mime)])
     return bindings or None
 
 

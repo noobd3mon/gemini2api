@@ -141,8 +141,9 @@ def upload_file(data: bytes, filename: str = None, mime_type: str = None) -> str
 
     start_headers = dict(common)
     start_headers.update({
+        # The browser only declares the length here. The mime type travels in
+        # the payload binding, so X-Goog-Upload-Header-Content-Type is not sent.
         "X-Goog-Upload-Header-Content-Length": str(len(data)),
-        "X-Goog-Upload-Header-Content-Type": mime_type,
         "X-Goog-Upload-Protocol": "resumable",
         "X-Goog-Upload-Command": "start",
         "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
