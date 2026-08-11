@@ -243,16 +243,42 @@ def _extract_texts_from_line(line: str) -> list:
         return []
 
 
+class GeminiUpstreamError(RuntimeError):
+    """Gemini refused the request itself; resending the same payload will not help."""
+
+
+# Real responses look like `...BardErrorInfo",[1100]]]`, so allow the quote/comma.
+BARD_ERROR_RE = re.compile(r'BardErrorInfo\D{0,8}\[\s*(\d+)')
+
+
+def bard_error_message(raw: str) -> str:
+    """Describe a BardErrorInfo code, with a hint for the common attachment failure."""
+    match = BARD_ERROR_RE.search(raw)
+    if not match:
+        return ""
+    code = match.group(1)
+    msg = f"Gemini upstream rejected request: BardErrorInfo [{code}]"
+    if code == "1100":
+        if load_cookie()[0]:
+            msg += (" - the attachment was refused. The cookie is most likely expired"
+                    " or has no file access; refresh GEMINI_COOKIE and retry.")
+        else:
+            msg += (" - file/image input needs a signed-in session. Set GEMINI_COOKIE;"
+                    " anonymous requests can only send text.")
+    return msg
+
+
 def extract_response_text(raw: str) -> str:
     """Parse full response to get final text."""
-    bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', raw)
-    if bard_err:
-        raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]")
     last_text = ""
     for line in raw.split("\n"):
         for t in _extract_texts_from_line(line):
             if len(t) > len(last_text):
                 last_text = t
+    if not last_text:
+        err = bard_error_message(raw)
+        if err:
+            raise GeminiUpstreamError(err)
     return clean_text(last_text)
 
 
@@ -278,6 +304,8 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
             raw = resp.read().decode("utf-8", errors="replace")
             return extract_response_text(raw)
+        except GeminiUpstreamError:
+            raise  # Gemini refused the payload; retrying only wastes time.
         except Exception as e:
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:
@@ -308,12 +336,10 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                 buf = ""
                 for chunk in resp.iter_text():
                     buf += chunk
-                    if "BardErrorInfo" in buf:
-                        bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', buf)
-                        if bard_err:
-                            raise RuntimeError(
-                                f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]"
-                            )
+                    if "BardErrorInfo" in buf and not emitted_raw_text:
+                        err = bard_error_message(buf)
+                        if err:
+                            raise GeminiUpstreamError(err)
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
                         for t in _extract_texts_from_line(line):
@@ -326,6 +352,8 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                             if delta:
                                 yield delta
             return
+        except GeminiUpstreamError:
+            raise  # Gemini refused the payload; retrying only wastes time.
         except Exception as e:
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:

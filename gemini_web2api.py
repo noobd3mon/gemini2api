@@ -583,6 +583,8 @@ def upload_attachments(attachments: list):
     """
     if not attachments:
         return None
+    if not load_cookie()[0]:
+        log("Attachments without GEMINI_COOKIE: Gemini only accepts files on a signed-in session")
     if len(attachments) == 1:
         results = [upload_one_attachment(0, attachments[0])]
     else:
@@ -661,11 +663,10 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
                 buf = ""
                 for chunk in resp.iter_text():
                     buf += chunk
-                    if "BardErrorInfo" in buf:
-                        import re as _re
-                        m = _re.search(r'BardErrorInfo\s*\[(\d+)\]', buf)
-                        if m:
-                            raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{m.group(1)}]")
+                    if "BardErrorInfo" in buf and not prev_text:
+                        err = bard_error_message(buf)
+                        if err:
+                            raise GeminiUpstreamError(err)
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
                         if '"wrb.fr"' not in line or len(line) < 200:
@@ -709,12 +710,33 @@ def clean_gemini_text(text: str, strip: bool = True) -> str:
     return text.strip() if strip else text
 
 
+class GeminiUpstreamError(RuntimeError):
+    """Gemini refused the request itself; resending the same payload will not help."""
+
+
+# Real responses look like `...BardErrorInfo",[1100]]]`, so allow the quote/comma.
+BARD_ERROR_RE = re.compile(r'BardErrorInfo\D{0,8}\[\s*(\d+)')
+
+
+def bard_error_message(raw: str) -> str:
+    """Describe a BardErrorInfo code, with a hint for the common attachment failure."""
+    match = BARD_ERROR_RE.search(raw)
+    if not match:
+        return ""
+    code = match.group(1)
+    msg = f"Gemini upstream rejected request: BardErrorInfo [{code}]"
+    if code == "1100":
+        if load_cookie()[0]:
+            msg += (" - the attachment was refused. The cookie is most likely expired"
+                    " or has no file access; refresh GEMINI_COOKIE and retry.")
+        else:
+            msg += (" - file/image input needs a signed-in session. Set GEMINI_COOKIE;"
+                    " anonymous requests can only send text.")
+    return msg
+
+
 def extract_response_text(raw: str) -> str:
     """Parse StreamGenerate response to extract final text."""
-    import re as _re
-    bard_err = _re.search(r'BardErrorInfo\s*\[(\d+)\]', raw)
-    if bard_err:
-        raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]")
     texts = []
     for line in raw.split("\n"):
         if '"wrb.fr"' not in line or len(line) < 200:
@@ -739,6 +761,10 @@ def extract_response_text(raw: str) -> str:
         if t.strip():
             text = t
             break
+    if not text:
+        err = bard_error_message(raw)
+        if err:
+            raise GeminiUpstreamError(err)
     return clean_gemini_text(text)
 
 
@@ -892,6 +918,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self._handle_google_models_list()
             elif self.path == "/":
                 self.send_json({"status": "ok", "version": __version__,
+                                # Attachments need a signed-in session, so surface it here.
+                                "cookie": bool(load_cookie()[0]),
                                 "models": list(MODELS.keys())})
             else:
                 self.send_json({"error": "not found"}, 404)

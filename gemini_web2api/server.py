@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from .config import CONFIG
 from .models import MODELS, resolve_model
-from .gemini import generate, generate_stream, log
+from .gemini import generate, generate_stream, load_cookie, log
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
 from .multimodal import upload_file, prepare_attachment, _cached_page_tokens
 from . import __version__
@@ -45,6 +45,8 @@ def _upload_attachments(attachments: list) -> list:
     """
     if not attachments:
         return None
+    if not load_cookie()[0]:
+        log("Attachments without GEMINI_COOKIE: Gemini only accepts files on a signed-in session")
     if len(attachments) == 1:
         results = [_upload_one(0, attachments[0])]
     else:
@@ -132,7 +134,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     for n, c in MODELS.items()
                 ]})
             elif self.path == "/":
-                self.send_json({"status": "ok", "version": __version__, "models": list(MODELS.keys())})
+                self.send_json({"status": "ok", "version": __version__,
+                            # Attachments only work on a signed-in session, so surface it here.
+                            "cookie": bool(load_cookie()[0]),
+                            "models": list(MODELS.keys())})
             else:
                 self.send_json({"error": "not found"}, 404)
         except (BrokenPipeError, ConnectionResetError):

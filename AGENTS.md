@@ -65,6 +65,16 @@ Precedence: `DEFAULT_CONFIG` < `config.json` (optional) < environment variables 
   Anthropic `source.data`, and Google `inlineData` / `fileData`. Values may be data URLs, raw base64
   or http(s) URLs (fetched right before upload).
 - `/v1/responses` must not flatten list content to text any more - that would drop attachments.
+- **Attachments need a signed-in session.** Without a cookie the upload still succeeds and returns a
+  `/contrib_service/ttl_1d/...` ref, but StreamGenerate replies with a ~216 byte body containing
+  `BardErrorInfo",[1100]` and no text. A bogus ref fails identically, so the ref is not the problem;
+  text-only prompts keep working anonymously. Check `GEMINI_COOKIE` on the host before debugging the
+  payload. `GET /` reports `"cookie": true/false` for exactly this reason.
+- Error detection: Gemini writes `...BardErrorInfo",[1100]]]`, so the old `BardErrorInfo\s*\[(\d+)\]`
+  regex never matched and every upstream refusal surfaced as an empty completion. `BARD_ERROR_RE`
+  (`BardErrorInfo\D{0,8}\[\s*(\d+)`) plus `bard_error_message()` now raise `GeminiUpstreamError`
+  with a cookie hint and skip the retry loop, in the package, the single file and `cloudflare/worker.js`.
+  Only raise when no text was parsed - a successful reply never contains `BardErrorInfo`.
 - Keep both copies in sync: `gemini_web2api/multimodal.py` + `tools.py` + `server.py` **and** the
   single-file `gemini_web2api.py`.
 
