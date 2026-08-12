@@ -63,7 +63,7 @@ DEFAULT_CONFIG = {
     "cookie_file": None,
     "proxy": None,
     "api_keys": [],
-    "temporary_chats": False,
+    "temporary_chats": True,
     "auto_update_bl": True,
 }
 
@@ -181,8 +181,14 @@ def account_prefix() -> str:
 
 
 def apply_chat_persistence_flags(inner: list) -> None:
-    """Apply Gemini Web persistence flags to an outgoing request payload."""
-    if CONFIG.get("temporary_chats", False):
+    """Apply Gemini Web persistence flags to an outgoing request payload.
+
+    The real web client sends inner[41]=[1] + inner[45]=1 (temporary) for every
+    StreamGenerate, including file-bearing requests (verified against a
+    2026-08-11 capture). The proxy defaults to temporary so API calls do not
+    litter the user's Gemini history with saved conversations.
+    """
+    if CONFIG.get("temporary_chats", True):
         inner[41] = [1]
         inner[45] = 1
     else:
@@ -1053,6 +1059,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             "auth_user": CONFIG.get("auth_user"),
             "account_prefix": account_prefix(),
             "bl": CONFIG.get("gemini_bl"),
+            "temporary_chats": CONFIG.get("temporary_chats", True),
             "xsrf_token_configured": bool(CONFIG.get("xsrf_token")),
             "page_scrape_ok": scrape_ok,
             "page_tokens": present,
@@ -1521,7 +1528,7 @@ def main():
     print(f"  Proxy:     {CONFIG.get('proxy') or 'none (uses system env HTTP_PROXY/HTTPS_PROXY)'}")
     print(f"  Retry:     {CONFIG['retry_attempts']}x / {CONFIG['retry_delay_sec']}s")
     print(f"  BL:        {CONFIG['gemini_bl']}")
-    print(f"  Temporary: {'yes' if CONFIG.get('temporary_chats', False) else 'no'}")
+    print(f"  Temporary: {'yes' if CONFIG.get('temporary_chats', True) else 'no'}")
     print()
     try:
         server.serve_forever()

@@ -180,8 +180,15 @@ def _build_file_bindings(file_refs: list) -> list:
 
 
 def _apply_chat_persistence_flags(inner: list) -> None:
-    """Apply Gemini Web chat persistence flags (temporary chats when enabled)."""
-    if CONFIG.get("temporary_chats", False):
+    """Apply Gemini Web chat persistence flags (temporary chats when enabled).
+
+    The real web client sends inner[41]=[1] + inner[45]=1 (temporary) for every
+    StreamGenerate, including file-bearing requests (verified against a
+    2026-08-11 capture). The proxy defaults to temporary so API calls do not
+    litter the user's Gemini history with saved conversations; TEMPORARY_CHATS=false
+    or config.json re-enables saving.
+    """
+    if CONFIG.get("temporary_chats", True):
         inner[41] = [1]
         inner[45] = 1
     else:

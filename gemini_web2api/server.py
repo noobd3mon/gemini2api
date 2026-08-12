@@ -231,6 +231,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             "auth_user": CONFIG.get("auth_user"),
             "account_prefix": _account_prefix(),
             "bl": CONFIG.get("gemini_bl"),
+            "temporary_chats": CONFIG.get("temporary_chats", True),
             "xsrf_token_configured": bool(CONFIG.get("xsrf_token")),
             "page_scrape_ok": scrape_ok,
             "page_tokens": present,

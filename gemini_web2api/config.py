@@ -22,7 +22,7 @@ DEFAULT_CONFIG = {
     "cookie_file": None,   # local file fallback (legacy / desktop use)
     "proxy": None,
     "api_keys": [],
-    "temporary_chats": False,
+    "temporary_chats": True,
     "auto_update_bl": True,
 }
 
