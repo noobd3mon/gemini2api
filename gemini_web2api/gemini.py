@@ -5,6 +5,7 @@ import uuid
 import re
 import urllib.request
 import urllib.parse
+import urllib.error
 import ssl
 import os
 import hashlib
@@ -108,6 +109,21 @@ def make_sapisidhash(sapisid: str) -> str:
     return f"SAPISIDHASH {ts}_{h}"
 
 
+def _page_token(name: str):
+    """Read a scraped Gemini app-page token (push_id/pctx/at/f_sid).
+
+    The tokens live in multimodal._cached_page_tokens(); import it lazily to
+    avoid a circular import (multimodal imports this module at load time). The
+    cache is warmed by the upload step, so this is a cache hit for attachment
+    requests and costs nothing (no fetch) for text-only ones.
+    """
+    try:
+        from .multimodal import _cached_page_tokens
+        return _cached_page_tokens().get(name)
+    except Exception:
+        return None
+
+
 def _account_prefix() -> str:
     """Return the Gemini account path prefix for non-default Google accounts."""
     auth_user = CONFIG.get("auth_user")
@@ -198,17 +214,31 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
     params = {"f.req": json.dumps(outer)}
     if CONFIG.get("xsrf_token"):
         params["at"] = CONFIG["xsrf_token"]
+    elif file_refs:
+        # The browser always sends an `at` XSRF token; use the one scraped from
+        # the app page (already cached by the upload step). Text-only requests
+        # are tolerated without it, so only attach it for file-bearing calls.
+        at = _page_token("at")
+        if at:
+            params["at"] = at
     return urllib.parse.urlencode(params)
 
 
-def _get_url() -> str:
+def _get_url(file_refs: list = None) -> str:
     reqid = int(time.time()) % 1000000
     account_prefix = _account_prefix()
-    return (
+    url = (
         f"https://gemini.google.com{account_prefix}/_/BardChatUi/data/"
         "assistant.lamda.BardFrontendService/StreamGenerate"
         f"?bl={CONFIG['gemini_bl']}&hl=en&_reqid={reqid}&rt=c"
     )
+    # The browser always sends f.sid; only attach it for file-bearing calls so
+    # text-only requests stay cheap (no page scrape needed).
+    if file_refs:
+        fsid = _page_token("f_sid")
+        if fsid:
+            url += f"&f.sid={fsid}"
+    return url
 
 
 def clean_text(text: str, strip: bool = True) -> str:
@@ -285,7 +315,7 @@ def extract_response_text(raw: str) -> str:
 def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
     """Non-streaming generation with retry."""
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
-    url = _get_url()
+    url = _get_url(file_refs)
     headers = _build_headers()
     ctx = _get_ssl_ctx()
     proxy = CONFIG.get("proxy")
@@ -306,6 +336,22 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
             return extract_response_text(raw)
         except GeminiUpstreamError:
             raise  # Gemini refused the payload; retrying only wastes time.
+        except urllib.error.HTTPError as e:
+            # 4xx (other than 405) is a permanent rejection - surface Gemini's
+            # body so the cause can be diagnosed instead of silently retrying.
+            if 400 <= e.code < 500 and e.code != 405:
+                snippet = ""
+                try:
+                    snippet = e.read().decode("utf-8", errors="replace")[:400]
+                except Exception:
+                    pass
+                raise GeminiUpstreamError(
+                    f"StreamGenerate HTTP {e.code} {e.reason}"
+                    + (f": {snippet}" if snippet else ""))
+            last_err = e
+            if attempt < CONFIG["retry_attempts"] - 1:
+                log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
+                time.sleep(CONFIG["retry_delay_sec"])
         except Exception as e:
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:
@@ -323,7 +369,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
         return
 
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
-    url = _get_url()
+    url = _get_url(file_refs)
     headers = _build_headers()
     client = _get_httpx_client()
 
@@ -354,6 +400,21 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
             return
         except GeminiUpstreamError:
             raise  # Gemini refused the payload; retrying only wastes time.
+        except httpx.HTTPStatusError as e:
+            code = e.response.status_code
+            if 400 <= code < 500 and code != 405:
+                snippet = ""
+                try:
+                    snippet = e.response.read().decode("utf-8", errors="replace")[:400]
+                except Exception:
+                    pass
+                raise GeminiUpstreamError(
+                    f"StreamGenerate HTTP {code}"
+                    + (f": {snippet}" if snippet else ""))
+            last_err = e
+            if attempt < CONFIG["retry_attempts"] - 1:
+                log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
+                time.sleep(CONFIG["retry_delay_sec"])
         except Exception as e:
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:

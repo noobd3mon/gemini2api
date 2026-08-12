@@ -311,7 +311,8 @@ def get_page_tokens() -> dict:
         html = _upload_open(urllib.request.Request(url, headers=headers), 30).read().decode("utf-8", errors="replace")
         for key, pattern in (("push_id", r'"qKIAYe":"([^"]+)"'),
                              ("pctx", r'"Ylro7b":"([^"]+)"'),
-                             ("at", r'"thykhd":"([^"]+)"')):
+                             ("at", r'"thykhd":"([^"]+)"'),
+                             ("f_sid", r'"FdrFJe":"([^"]+)"')):
             m = re.search(pattern, html)
             if m:
                 tokens[key] = m.group(1)
@@ -424,6 +425,10 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
     params = {"f.req": json.dumps(outer)}
     if CONFIG.get("xsrf_token"):
         params["at"] = CONFIG["xsrf_token"]
+    elif file_refs:
+        at = get_page_tokens().get("at")
+        if at:
+            params["at"] = at
     body = urllib.parse.urlencode(params).encode()
     reqid = int(time.time()) % 1000000
     prefix = account_prefix()
@@ -432,6 +437,10 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
         "assistant.lamda.BardFrontendService/StreamGenerate"
         f"?bl={CONFIG['gemini_bl']}&hl=en&_reqid={reqid}&rt=c"
     )
+    if file_refs:
+        fsid = get_page_tokens().get("f_sid")
+        if fsid:
+            url += f"&f.sid={fsid}"
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
         "Origin": "https://gemini.google.com",
@@ -471,9 +480,22 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
                     "assistant.lamda.BardFrontendService/StreamGenerate"
                     f"?bl={CONFIG['gemini_bl']}&hl=en&_reqid={reqid}&rt=c"
                 )
+                if file_refs:
+                    fsid = get_page_tokens().get("f_sid")
+                    if fsid:
+                        url += f"&f.sid={fsid}"
                 log("Retrying with updated BL...")
                 last_err = e
                 continue
+            if 400 <= e.code < 500:
+                snippet = ""
+                try:
+                    snippet = e.read().decode("utf-8", errors="replace")[:400]
+                except Exception:
+                    pass
+                raise GeminiUpstreamError(
+                    f"StreamGenerate HTTP {e.code} {e.reason}"
+                    + (f": {snippet}" if snippet else ""))
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:
                 log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
@@ -621,6 +643,10 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
     params = {"f.req": json.dumps(outer)}
     if CONFIG.get("xsrf_token"):
         params["at"] = CONFIG["xsrf_token"]
+    elif file_refs:
+        at = get_page_tokens().get("at")
+        if at:
+            params["at"] = at
     body = urllib.parse.urlencode(params)
     reqid = int(time.time()) % 1000000
     prefix = account_prefix()
@@ -629,6 +655,10 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
         "assistant.lamda.BardFrontendService/StreamGenerate"
         f"?bl={CONFIG['gemini_bl']}&hl=en&_reqid={reqid}&rt=c"
     )
+    if file_refs:
+        fsid = get_page_tokens().get("f_sid")
+        if fsid:
+            url += f"&f.sid={fsid}"
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
         "Origin": "https://gemini.google.com",
@@ -693,11 +723,20 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
             if HAS_HTTPX and hasattr(e, 'response') and getattr(e.response, 'status_code', 0) == 405:
                 if update_bl_if_needed():
                     log("BL updated, falling back to non-streaming for this request")
-                    raw = gemini_stream_generate(prompt, model_id, think_mode)
+                    raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs)
                     text = extract_response_text(raw)
                     if text:
                         yield text
                     return
+            if HAS_HTTPX and hasattr(e, 'response') and 400 <= getattr(e.response, 'status_code', 0) < 500:
+                snippet = ""
+                try:
+                    snippet = e.response.read().decode("utf-8", errors="replace")[:400]
+                except Exception:
+                    pass
+                raise GeminiUpstreamError(
+                    f"StreamGenerate HTTP {e.response.status_code}"
+                    + (f": {snippet}" if snippet else ""))
             raise
 
 

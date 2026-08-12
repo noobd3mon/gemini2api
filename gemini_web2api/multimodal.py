@@ -92,6 +92,7 @@ def _get_page_tokens() -> dict:
             ("push_id", r'"qKIAYe":"([^"]+)"'),
             ("pctx", r'"Ylro7b":"([^"]+)"'),
             ("at", r'"thykhd":"([^"]+)"'),
+            ("f_sid", r'"FdrFJe":"([^"]+)"'),
         ):
             m = re.search(pattern, html)
             if m:
