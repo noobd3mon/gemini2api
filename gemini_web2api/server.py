@@ -9,9 +9,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 from .config import CONFIG
 from .models import MODELS, resolve_model
-from .gemini import generate, generate_stream, load_cookie, log
+from .gemini import generate, generate_stream, load_cookie, log, _account_prefix
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
-from .multimodal import upload_file, prepare_attachment, _cached_page_tokens
+from .multimodal import (upload_file, prepare_attachment, _cached_page_tokens,
+                         _get_page_tokens)
 from . import __version__
 
 
@@ -133,6 +134,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
                      "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]}
                     for n, c in MODELS.items()
                 ]})
+            elif self.path == "/v1/diag":
+                self._diag()
             elif self.path == "/":
                 self.send_json({"status": "ok", "version": __version__,
                             # Attachments only work on a signed-in session, so surface it here.
@@ -190,6 +193,49 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": {"message": str(e)}}, 500)
             except:
                 pass
+
+    # ─── /v1/diag (read-only diagnostic) ───────────────────────────────────────
+
+    def _diag(self):
+        """Read-only diagnostic: did the Gemini app-page token scrape succeed?
+
+        Reports token presence (not values) so an attachment BardErrorInfo [1100]
+        can be traced to a failed page scrape (default push_id/pctx, missing
+        at/f.sid) instead of guessing. Never prints the cookie value.
+        """
+        cookie_str, sapisid = load_cookie()
+        try:
+            tokens = _get_page_tokens()  # fresh scrape; ignore the 10-min cache
+        except Exception as e:
+            self.send_json({"cookie": bool(cookie_str), "has_sapisid": bool(sapisid),
+                            "page_scrape_ok": False, "page_scrape_error": str(e)})
+            return
+
+        # at/f_sid are what the file-request path actually sends; their absence
+        # means the at/f.sid fix cannot attach them and the attachment is refused.
+        present = {k: bool(tokens.get(k)) for k in ("push_id", "pctx", "at", "f_sid")}
+        scrape_ok = present["at"] and present["f_sid"]
+        if not scrape_ok:
+            hint = ("app page did not yield at/f.sid -> file requests send no XSRF and "
+                    "the attachment is refused ([1100]). The cookie may not load /app "
+                    "authenticated: ensure GEMINI_COOKIE is the FULL Cookie header (incl. "
+                    "__Secure-1PSID) and GEMINI_AUTH_USER matches the account.")
+        else:
+            hint = ("at/f.sid present and sent on file requests. If attachments still "
+                    "return [1100], the cookie lacks file-access scope (text works but "
+                    "Gemini gates file input for this account/region); re-paste a fresh "
+                    "full cookie from a signed-in browser tab that can attach files.")
+        self.send_json({
+            "cookie": bool(cookie_str),
+            "has_sapisid": bool(sapisid),
+            "auth_user": CONFIG.get("auth_user"),
+            "account_prefix": _account_prefix(),
+            "bl": CONFIG.get("gemini_bl"),
+            "xsrf_token_configured": bool(CONFIG.get("xsrf_token")),
+            "page_scrape_ok": scrape_ok,
+            "page_tokens": present,
+            "hint": hint,
+        })
 
     # ─── /v1/chat/completions ─────────────────────────────────────────────────
 

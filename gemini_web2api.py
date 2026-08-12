@@ -955,6 +955,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 ]})
             elif self.path.startswith("/v1beta/models"):
                 self._handle_google_models_list()
+            elif self.path == "/v1/diag":
+                self._diag()
             elif self.path == "/":
                 self.send_json({"status": "ok", "version": __version__,
                                 # Attachments need a signed-in session, so surface it here.
@@ -1014,6 +1016,48 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": {"message": str(e)}}, 500)
             except:
                 pass
+
+    def _diag(self):
+        """Read-only diagnostic: did the Gemini app-page token scrape succeed?
+
+        Reports token presence (not values) so an attachment BardErrorInfo [1100]
+        can be traced to a failed page scrape (default push_id/pctx, missing
+        at/f.sid) instead of guessing. Never prints the cookie value.
+        """
+        cookie_str, sapisid = load_cookie()
+        try:
+            _page_tokens_cache["ts"] = 0  # force a fresh scrape, ignore the cache
+            tokens = get_page_tokens()
+        except Exception as e:
+            self.send_json({"cookie": bool(cookie_str), "has_sapisid": bool(sapisid),
+                            "page_scrape_ok": False, "page_scrape_error": str(e)})
+            return
+
+        # at/f_sid are what the file-request path actually sends; their absence
+        # means the at/f.sid fix cannot attach them and the attachment is refused.
+        present = {k: bool(tokens.get(k)) for k in ("push_id", "pctx", "at", "f_sid")}
+        scrape_ok = present["at"] and present["f_sid"]
+        if not scrape_ok:
+            hint = ("app page did not yield at/f.sid -> file requests send no XSRF and "
+                    "the attachment is refused ([1100]). The cookie may not load /app "
+                    "authenticated: ensure GEMINI_COOKIE is the FULL Cookie header (incl. "
+                    "__Secure-1PSID) and GEMINI_AUTH_USER matches the account.")
+        else:
+            hint = ("at/f.sid present and sent on file requests. If attachments still "
+                    "return [1100], the cookie lacks file-access scope (text works but "
+                    "Gemini gates file input for this account/region); re-paste a fresh "
+                    "full cookie from a signed-in browser tab that can attach files.")
+        self.send_json({
+            "cookie": bool(cookie_str),
+            "has_sapisid": bool(sapisid),
+            "auth_user": CONFIG.get("auth_user"),
+            "account_prefix": account_prefix(),
+            "bl": CONFIG.get("gemini_bl"),
+            "xsrf_token_configured": bool(CONFIG.get("xsrf_token")),
+            "page_scrape_ok": scrape_ok,
+            "page_tokens": present,
+            "hint": hint,
+        })
 
     def _resolve_model(self, model_name):
         think_override = None
