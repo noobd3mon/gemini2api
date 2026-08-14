@@ -8,6 +8,10 @@ MODELS = {
         "mode": 1, "think": 4,
         "desc": "Latest all-around model (Gemini 3.6 Flash)",
     },
+    "gemini-3.7-flash": {
+        "mode": 1, "think": 4,
+        "desc": "Gemini 3.7 Flash (FAST; mode 1 - same wire id as 3.6-flash, renamed)",
+    },
     "gemini-3.5-flash": {
         "mode": 1, "think": 4,
         "desc": "Alias for gemini-3.6-flash (backend upgraded)",

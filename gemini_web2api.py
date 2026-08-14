@@ -78,6 +78,10 @@ MODELS = {
         "mode": 1, "think": 4,
         "desc": "Latest all-around model (Gemini 3.6 Flash)",
     },
+    "gemini-3.7-flash": {
+        "mode": 1, "think": 4,
+        "desc": "Gemini 3.7 Flash (FAST; mode 1 - same wire id as 3.6-flash, renamed)",
+    },
     "gemini-3.5-flash": {
         "mode": 1, "think": 4,
         "desc": "Alias for gemini-3.6-flash (backend upgraded)",
@@ -691,6 +695,7 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
         return
 
     prev_text = ""
+    emitted_images = set()
     transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
     with httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True) as client:
         try:
@@ -723,6 +728,10 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
                                                 if delta:
                                                     yield delta
                                                 prev_text = t
+                            for gg in _find_gg_dl_urls(inner2):
+                                if gg not in emitted_images:
+                                    emitted_images.add(gg)
+                                    yield f"\n\n![generated image]({resolve_image_url(gg)})\n"
                         except (json.JSONDecodeError, IndexError, TypeError):
                             pass
         except Exception as e:
@@ -752,7 +761,68 @@ def clean_gemini_text(text: str, strip: bool = True) -> str:
         r'```(?:python|javascript|text)\?code_(?:reference|stdout)&code_event_index=\d+\n.*?```\n?',
         '', text, flags=re.DOTALL
     )
+    text = re.sub(r'http://googleusercontent\.com/(?:card_content|image_generation_content)/\w+\n?', '', text)
     return text.strip() if strip else text
+
+
+# Generated images come back as lh3.googleusercontent.com/gg-dl/<token> resolver URLs
+# nested in the response. GET-ing a gg-dl URL returns text/plain = the directly
+# viewable rd-gg-dl/<token> image URL (image/jpeg, no auth - just a gemini referer).
+# The text part of an image reply is a useless image_generation_content placeholder,
+# which clean_gemini_text strips; we append the resolved image as markdown instead.
+GG_DL_URL_RE = re.compile(r'https://lh3\.googleusercontent\.com/gg-dl/[A-Za-z0-9_-]+')
+
+
+def _find_gg_dl_urls(obj) -> list:
+    """Recursively collect de-duplicated gg-dl image resolver URLs from a parsed response."""
+    found = []
+
+    def walk(x):
+        if isinstance(x, str):
+            if "lh3.googleusercontent.com/gg-dl/" in x:
+                m = GG_DL_URL_RE.search(x)
+                if m and m.group(0) not in found:
+                    found.append(m.group(0))
+        elif isinstance(x, list):
+            for i in x:
+                walk(i)
+        elif isinstance(x, dict):
+            for v in x.values():
+                walk(v)
+
+    walk(obj)
+    return found
+
+
+def _extract_image_urls_from_line(line: str) -> list:
+    """Parse a wrb.fr line and return any gg-dl image URLs it carries."""
+    if '"wrb.fr"' not in line or len(line) < 200:
+        return []
+    try:
+        arr = json.loads(line)
+        inner_str = arr[0][2]
+        if not inner_str:
+            return []
+        return _find_gg_dl_urls(json.loads(inner_str))
+    except (json.JSONDecodeError, IndexError, TypeError):
+        return []
+
+
+def resolve_image_url(gg_url: str, timeout: int = 15) -> str:
+    """Resolve a gg-dl resolver URL to the directly viewable image URL."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://gemini.google.com/",
+    }
+    try:
+        req = urllib.request.Request(gg_url, headers=headers)
+        resp = urllib.request.urlopen(req, context=ssl.create_default_context(), timeout=timeout)
+        body = resp.read().decode("utf-8", errors="replace").strip()
+        if body.startswith("http") and "usercontent" in body:
+            return body
+    except Exception as e:
+        log(f"image resolve failed: {e}")
+    return gg_url
 
 
 class GeminiUpstreamError(RuntimeError):
@@ -781,8 +851,10 @@ def bard_error_message(raw: str) -> str:
 
 
 def extract_response_text(raw: str) -> str:
-    """Parse StreamGenerate response to extract final text."""
+    """Parse StreamGenerate response to extract final text + generated images."""
     texts = []
+    image_urls = []
+    seen = set()
     for line in raw.split("\n"):
         if '"wrb.fr"' not in line or len(line) < 200:
             continue
@@ -801,16 +873,23 @@ def extract_response_text(raw: str) -> str:
                                     texts.append(t)
         except (json.JSONDecodeError, IndexError, TypeError):
             pass
+        for gg in _extract_image_urls_from_line(line):
+            if gg not in seen:
+                seen.add(gg)
+                image_urls.append(gg)
     text = ""
     for t in reversed(texts):
         if t.strip():
             text = t
             break
-    if not text:
+    if not text and not image_urls:
         err = bard_error_message(raw)
         if err:
             raise GeminiUpstreamError(err)
-    return clean_gemini_text(text)
+    text = clean_gemini_text(text)
+    for gg in image_urls:
+        text += f"\n\n![generated image]({resolve_image_url(gg)})"
+    return text
 
 
 # ─── OpenAI Format Helpers ───────────────────────────────────────────────────

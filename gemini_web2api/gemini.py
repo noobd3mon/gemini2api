@@ -253,7 +253,7 @@ def clean_text(text: str, strip: bool = True) -> str:
         r'```(?:python|javascript|text)\?code_(?:reference|stdout)&code_event_index=\d+\n.*?```\n?',
         '', text, flags=re.DOTALL
     )
-    text = re.sub(r'http://googleusercontent\.com/card_content/\d+\n?', '', text)
+    text = re.sub(r'http://googleusercontent\.com/(?:card_content|image_generation_content)/\w+\n?', '', text)
     return text.strip() if strip else text
 
 
@@ -278,6 +278,70 @@ def _extract_texts_from_line(line: str) -> list:
         return texts
     except (json.JSONDecodeError, IndexError, TypeError):
         return []
+
+
+# Generated images come back as lh3.googleusercontent.com/gg-dl/<token> resolver URLs
+# nested in the response. GET-ing a gg-dl URL returns text/plain = the directly
+# viewable rd-gg-dl/<token> image URL (image/jpeg, no auth - just a gemini referer).
+# The text part of an image reply is a useless image_generation_content placeholder,
+# which clean_text strips; we append the resolved image as markdown instead.
+GG_DL_URL_RE = re.compile(r'https://lh3\.googleusercontent\.com/gg-dl/[A-Za-z0-9_-]+')
+
+
+def _find_gg_dl_urls(obj) -> list:
+    """Recursively collect de-duplicated gg-dl image resolver URLs from a parsed response."""
+    found = []
+
+    def walk(x):
+        if isinstance(x, str):
+            if "lh3.googleusercontent.com/gg-dl/" in x:
+                m = GG_DL_URL_RE.search(x)
+                if m and m.group(0) not in found:
+                    found.append(m.group(0))
+        elif isinstance(x, list):
+            for i in x:
+                walk(i)
+        elif isinstance(x, dict):
+            for v in x.values():
+                walk(v)
+
+    walk(obj)
+    return found
+
+
+def _extract_image_urls_from_line(line: str) -> list:
+    """Parse a wrb.fr line and return any gg-dl image URLs it carries."""
+    if '"wrb.fr"' not in line or len(line) < 200:
+        return []
+    try:
+        arr = json.loads(line)
+        inner_str = arr[0][2]
+        if not inner_str:
+            return []
+        return _find_gg_dl_urls(json.loads(inner_str))
+    except (json.JSONDecodeError, IndexError, TypeError):
+        return []
+
+
+def resolve_image_url(gg_url: str, timeout: int = 15) -> str:
+    """Resolve a gg-dl resolver URL to the directly viewable image URL.
+
+    Returns the rd-gg-dl/<token> URL (image/jpeg) that clients can hotlink, or the
+    original gg-dl URL if resolution fails.
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://gemini.google.com/",
+    }
+    try:
+        req = urllib.request.Request(gg_url, headers=headers)
+        resp = urllib.request.urlopen(req, context=_get_ssl_ctx(), timeout=timeout)
+        body = resp.read().decode("utf-8", errors="replace").strip()
+        if body.startswith("http") and "usercontent" in body:
+            return body
+    except Exception as e:
+        log(f"image resolve failed: {e}")
+    return gg_url
 
 
 class GeminiUpstreamError(RuntimeError):
@@ -306,17 +370,26 @@ def bard_error_message(raw: str) -> str:
 
 
 def extract_response_text(raw: str) -> str:
-    """Parse full response to get final text."""
+    """Parse full response to get final text, with generated images as markdown."""
     last_text = ""
+    image_urls = []
+    seen = set()
     for line in raw.split("\n"):
         for t in _extract_texts_from_line(line):
             if len(t) > len(last_text):
                 last_text = t
-    if not last_text:
+        for gg in _extract_image_urls_from_line(line):
+            if gg not in seen:
+                seen.add(gg)
+                image_urls.append(gg)
+    if not last_text and not image_urls:
         err = bard_error_message(raw)
         if err:
             raise GeminiUpstreamError(err)
-    return clean_text(last_text)
+    text = clean_text(last_text)
+    for gg in image_urls:
+        text += f"\n\n![generated image]({resolve_image_url(gg)})"
+    return text
 
 
 def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
@@ -382,6 +455,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
 
     last_err = None
     emitted_raw_text = ""
+    emitted_images = set()
     for attempt in range(CONFIG["retry_attempts"]):
         try:
             with client.stream("POST", url, content=body, headers=headers) as resp:
@@ -404,6 +478,10 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                             emitted_raw_text = t
                             if delta:
                                 yield delta
+                        for gg in _extract_image_urls_from_line(line):
+                            if gg not in emitted_images:
+                                emitted_images.add(gg)
+                                yield f"\n\n![generated image]({resolve_image_url(gg)})\n"
             return
         except GeminiUpstreamError:
             raise  # Gemini refused the payload; retrying only wastes time.
