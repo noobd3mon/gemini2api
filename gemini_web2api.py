@@ -628,6 +628,15 @@ def upload_attachments(attachments: list):
     return [r for r in results if r] or None
 
 
+def _common_prefix_len(a: str, b: str) -> int:
+    """Length of the longest common prefix of two strings (codepoint-wise)."""
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
+
 def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, file_refs: list = None):
     """Send prompt and yield incremental text deltas using httpx streaming."""
     inner = [None] * 80
@@ -722,12 +731,26 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
                                 for part in inner2[4]:
                                     if isinstance(part, list) and len(part) > 1 and part[1] and isinstance(part[1], list):
                                         for t in part[1]:
-                                            if isinstance(t, str) and len(t) > len(prev_text):
-                                                delta = t[len(prev_text):]
-                                                delta = clean_gemini_text(delta, strip=False)
-                                                if delta:
-                                                    yield delta
-                                                prev_text = t
+                                            if not isinstance(t, str) or not t:
+                                                continue
+                                            if t == prev_text or prev_text.startswith(t):
+                                                continue
+                                            if t.startswith(prev_text):
+                                                delta = clean_gemini_text(t[len(prev_text):], strip=False)
+                                            else:
+                                                # Gemini revised mid-stream: `t` is not a prefix-extension
+                                                # of what we already streamed. SSE deltas are append-only so
+                                                # we can't retract the old text; emit only the part beyond
+                                                # the common prefix so the stream completes instead of
+                                                # dropping (a drop makes the client retry and concatenate,
+                                                # repeating the whole intro).
+                                                cp = _common_prefix_len(prev_text, t)
+                                                delta = clean_gemini_text(t[cp:], strip=False)
+                                                if delta and delta in prev_text:
+                                                    delta = ""
+                                            prev_text = t
+                                            if delta:
+                                                yield delta
                             for gg in _find_gg_dl_urls(inner2):
                                 if gg not in emitted_images:
                                     emitted_images.add(gg)

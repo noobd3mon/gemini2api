@@ -440,6 +440,15 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
     raise last_err
 
 
+def _common_prefix_len(a: str, b: str) -> int:
+    """Length of the longest common prefix of two strings (codepoint-wise)."""
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
+
 def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None):
     """Streaming generation via httpx with retry on connection failure."""
     if not HAS_HTTPX:
@@ -472,9 +481,19 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                         for t in _extract_texts_from_line(line):
                             if t == emitted_raw_text or emitted_raw_text.startswith(t):
                                 continue
-                            if not t.startswith(emitted_raw_text):
-                                raise RuntimeError("Gemini stream content changed during retry")
-                            delta = clean_text(t[len(emitted_raw_text):], strip=False)
+                            if t.startswith(emitted_raw_text):
+                                delta = clean_text(t[len(emitted_raw_text):], strip=False)
+                            else:
+                                # Gemini revised mid-stream: `t` is not a prefix-extension of
+                                # what we already streamed. SSE deltas are append-only so we
+                                # can't retract the old text; emit only the part of `t` beyond
+                                # the common prefix so the stream completes. Raising here drops
+                                # the stream and makes the client retry and concatenate, which
+                                # repeats the whole intro.
+                                cp = _common_prefix_len(emitted_raw_text, t)
+                                delta = clean_text(t[cp:], strip=False)
+                                if delta and delta in emitted_raw_text:
+                                    delta = ""
                             emitted_raw_text = t
                             if delta:
                                 yield delta
