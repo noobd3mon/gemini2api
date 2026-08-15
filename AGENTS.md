@@ -11,12 +11,14 @@ OpenAI-compatible HTTP proxy in front of Gemini Web. Pure stdlib except optional
 
 | Path | Role |
 | --- | --- |
-| `gemini_web2api/` | The package used by Docker/Railway (`python -m gemini_web2api`) |
+| `gemini_web2api/` | The package used by Docker/Railway (`python -m gemini_web2api`). **The only hand-edited source.** |
 | `gemini_web2api/config.py` | Defaults + optional `config.json` + **env var loading** (`load_env_config`) |
-| `gemini_web2api/gemini.py` | Gemini StreamGenerate protocol, cookie loading, retries |
-| `gemini_web2api/server.py` | HTTP handler: `/v1/chat/completions`, `/v1/responses`, `/v1beta/...`, `/` health |
+| `gemini_web2api/gemini.py` | Gemini StreamGenerate protocol, cookie loading, retries, image output |
+| `gemini_web2api/server.py` | HTTP handler: `/v1/chat/completions`, `/v1/responses`, `/v1beta/...`, `/v1/diag`, `/admin/cookie`, `/` health |
 | `gemini_web2api/multimodal.py`, `tools.py`, `models.py` | Uploads, tool calling, model table |
-| `gemini_web2api.py` | Standalone single-file copy of the same server (kept in sync manually) |
+| `gemini_web2api.py` | **GENERATED** standalone single-file copy. Never edit it - change the package and run `python build_single_file.py`. |
+| `build_single_file.py` | Merges the package modules into `gemini_web2api.py` (strips relative imports, dedupes stdlib imports) |
+| `tests/` | Stdlib `unittest` suite: `python -m unittest discover -s tests` |
 | `Dockerfile`, `railway.json`, `.env.example` | Deployment: Docker build, Railway config, env template |
 | `cloudflare/`, `gemini-cookie-sync-extension/` | Independent side projects, not part of the Python server |
 
@@ -24,13 +26,19 @@ OpenAI-compatible HTTP proxy in front of Gemini Web. Pure stdlib except optional
 
 Precedence: `DEFAULT_CONFIG` < `config.json` (optional) < environment variables < CLI flags.
 
-- Env mapping lives in `config.py` (`ENV_STR`, `ENV_INT`, `ENV_BOOL`, `ENV_KEYS`) and is mirrored
-  in `apply_env_overrides()` inside the single-file `gemini_web2api.py`. **Change both.**
+- Env mapping lives ONLY in `config.py` (`ENV_STR`, `ENV_INT`, `ENV_BOOL`, `ENV_KEYS`). The
+  single-file copy is generated from it, so there is no second mapping to keep in sync.
 - Cookie: `GEMINI_COOKIE` (raw `Cookie` header on one line, or JSON `{"cookie":..., "sapisid":...}`).
   Surrounding quotes are stripped, `SAPISID` is parsed out automatically, `GEMINI_SAPISID` overrides it.
-  `cookie_file` still works as a fallback and keeps its mtime cache.
+  `cookie_file` still works as a fallback and keeps its mtime cache. `POST /admin/cookie` (auth:
+  `ADMIN_KEY` env, falling back to API keys) updates the cookie at runtime and invalidates the
+  cached cookies/page tokens - no restart needed.
 - `PORT` (Railway) and `GEMINI_PORT` both map to `config["port"]`; `HOST` defaults to `0.0.0.0`.
 - `API_KEYS` accepts a comma/space/semicolon list or a JSON array. Empty = auth disabled.
+  Comparisons are `hmac.compare_digest` (timing-safe).
+- Newer keys: `image_format` ("markdown"/"url", env `GEMINI_IMAGE_FORMAT`), `rate_limit`
+  (req/min/key, env `GEMINI_RATE_LIMIT`, 0=off), `admin_key` (env `GEMINI_ADMIN_KEY`),
+  `token_cache_file` (env `GEMINI_TOKEN_CACHE_FILE`, opt-in file cache for scraped page tokens).
 - Do not reintroduce a required `config.json`: the Docker image must boot with env vars only.
 
 ## Multimodal (files/images)
@@ -50,13 +58,11 @@ Precedence: `DEFAULT_CONFIG` < `config.json` (optional) < environment variables 
     (`"qKIAYe"`, `"Ylro7b"`, 10-minute cache) and fall back to the constants captured in
     `Capture mẫu/capture-gemini.google.com-*.md` (gitignored - captures contain cookies).
     A 3-file capture reused one `push-id` / `pctx` for all three uploads and fired them
-    concurrently, so `_upload_attachments` (package) / `upload_attachments` (single file)
-    upload through a `ThreadPoolExecutor`: max 4 workers, token cache warmed once before the
-    pool starts, single attachment stays on the direct path, failures are skipped and the
-    result keeps attachment order.
+    concurrently, so `_upload_attachments` uploads through a `ThreadPoolExecutor`: max 4 workers,
+    token cache warmed once before the pool starts, single attachment stays on the direct path,
+    failures are skipped and the result keeps attachment order.
 - The reference is bound into the chat payload at `inner[0][3]`:
-  `[[[<file_ref>, <kind>, null, <mime>], <filename>], ...]`
-  (`_build_file_bindings` in the package, `build_file_bindings` in the single file).
+  `[[[<file_ref>, <kind>, null, <mime>], <filename>], ...]` (`_build_file_bindings`).
   `<kind>` is `1` for images and `3` for every other type (capture: image/png and image/jpeg
   -> `1`, text/plain -> `3`). Several files are just more entries in the same list, in
   attachment order.
@@ -72,11 +78,21 @@ Precedence: `DEFAULT_CONFIG` < `config.json` (optional) < environment variables 
   payload. `GET /` reports `"cookie": true/false` for exactly this reason.
 - Error detection: Gemini writes `...BardErrorInfo",[1100]]]`, so the old `BardErrorInfo\s*\[(\d+)\]`
   regex never matched and every upstream refusal surfaced as an empty completion. `BARD_ERROR_RE`
-  (`BardErrorInfo\D{0,8}\[\s*(\d+)`) plus `bard_error_message()` now raise `GeminiUpstreamError`
-  with a cookie hint and skip the retry loop, in the package, the single file and `cloudflare/worker.js`.
-  Only raise when no text was parsed - a successful reply never contains `BardErrorInfo`.
-- Keep both copies in sync: `gemini_web2api/multimodal.py` + `tools.py` + `server.py` **and** the
-  single-file `gemini_web2api.py`.
+  (`BardErrorInfo\D{0,8}\[\s*(\d+)`) plus `bard_error_message()` raise `GeminiUpstreamError`
+  with a cookie hint and skip the retry loop. Only raise when no text was parsed - a successful
+  reply never contains `BardErrorInfo`.
+
+## Streaming (deltas)
+
+- Gemini frames grow cumulatively but can revise mid-stream (intro + "Anh cần" -> intro +
+  "Hôm nay anh cần..."). SSE deltas are append-only, so on a non-prefix frame emit only the part
+  of the new text beyond the longest common prefix (`_delta_from`); raising/dropping makes the
+  client retry and concatenate, which repeats the whole intro (the bug fixed in 4121fc6).
+- `extract_response_text` prefers the LAST non-empty text (the final draft), not the longest.
+- The final frame carries a completion status at `inner[26][0][0][0][1][1]` (0 = normal in every
+  capture). `extract_finish_status()` reads it; only 0 is mapped, other codes are logged.
+- StreamGenerate responses contain NO token usage (checked against 2026-08-11/14 captures):
+  `_usage` is a char-count estimate; `stream_options.include_usage` returns that estimate.
 
 ## Deployment invariants
 
@@ -86,16 +102,15 @@ Precedence: `DEFAULT_CONFIG` < `config.json` (optional) < environment variables 
   so Railway logs stream, and runs `python -m gemini_web2api`.
 - Secrets never land in the image; `.env` is gitignored, `.env.example` is the template.
 
-## Verify (no test suite in this repo)
+## Verify
 
 ```cmd
 python -m py_compile gemini_web2api.py gemini_web2api\config.py gemini_web2api\gemini.py gemini_web2api\__main__.py gemini_web2api\server.py gemini_web2api\multimodal.py gemini_web2api\tools.py gemini_web2api\models.py
+python -m unittest discover -s tests
 ```
 
-For behaviour changes write a temporary `_verify_*.py` that sets `os.environ`, calls
-`load_env_config()` / `load_cookie()`, asserts the result, validates `railway.json`, then delete it.
-Load the single-file variant with `importlib.util.spec_from_file_location` - a plain
-`import gemini_web2api` resolves to the package directory instead.
+After ANY package change: run `python build_single_file.py`, then re-run the tests - the
+`tests/test_single_file.py` parity guard fails when the single file has not been regenerated.
 
 Smoke test locally:
 
@@ -113,5 +128,4 @@ curl http://localhost:8081/
   matched text or the match silently fails.
 - Code, comments and docs in this repo are English. Keep the existing 4-space, stdlib-first style.
 - The startup `bl` refresh hits the network; gate it with `AUTO_UPDATE_BL=false` in offline tests.
-- `README_CN.md` still documents the old `config.json`-only flow; update it when touching README.md docs.
 - Never log or print the cookie value - print only its source (`env GEMINI_COOKIE` / `file <path>`).

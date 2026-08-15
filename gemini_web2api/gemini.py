@@ -103,6 +103,16 @@ def load_cookie() -> tuple:
         return _cookie_cache["str"], _cookie_cache["sapisid"]
 
 
+def _invalidate_cookie_cache() -> None:
+    """Drop cached cookies and page tokens so a runtime cookie update takes effect."""
+    _cookie_cache.update({"str": "", "sapisid": None, "mtime": 0})
+    try:
+        from .multimodal import _invalidate_page_tokens
+        _invalidate_page_tokens()
+    except Exception:
+        pass
+
+
 def make_sapisidhash(sapisid: str) -> str:
     ts = int(time.time())
     h = hashlib.sha1(f"{ts} {sapisid} https://gemini.google.com".encode()).hexdigest()
@@ -130,6 +140,42 @@ def _account_prefix() -> str:
     if auth_user is None or auth_user == "":
         return ""
     return f"/u/{auth_user}"
+
+
+def fetch_latest_bl() -> str:
+    """Fetch the current gemini_bl build label from the Gemini app page."""
+    if not CONFIG.get("auto_update_bl", True):
+        return None
+    try:
+        req = urllib.request.Request(
+            "https://gemini.google.com/app",
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+        ctx = _get_ssl_ctx()
+        proxy = CONFIG.get("proxy")
+        if proxy:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+                urllib.request.HTTPSHandler(context=ctx))
+            resp = opener.open(req, timeout=15)
+        else:
+            resp = urllib.request.urlopen(req, context=ctx, timeout=15)
+        html = resp.read().decode("utf-8", errors="replace")
+        m = re.search(r'(boq_assistant-bard-web-server_\d+\.\d+_p\d+)', html)
+        if m:
+            return m.group(1)
+    except Exception as e:
+        log(f"BL auto-update fetch failed: {e}")
+    return None
+
+
+def update_bl_if_needed() -> bool:
+    """Attempt to fetch and update gemini_bl. Returns True if updated."""
+    new_bl = fetch_latest_bl()
+    if new_bl and new_bl != CONFIG["gemini_bl"]:
+        log(f"BL auto-updated: {CONFIG['gemini_bl']} -> {new_bl}")
+        CONFIG["gemini_bl"] = new_bl
+        return True
+    return False
 
 
 def _build_headers() -> dict:
@@ -257,34 +303,40 @@ def clean_text(text: str, strip: bool = True) -> str:
     return text.strip() if strip else text
 
 
-def _extract_texts_from_line(line: str) -> list:
-    """Parse a single wrb.fr line and return list of text strings found."""
+def _parse_inner(line: str):
+    """Parse a wrb.fr line into its inner payload list, or None."""
     if '"wrb.fr"' not in line or len(line) < 200:
-        return []
+        return None
     try:
         arr = json.loads(line)
         inner_str = arr[0][2]
-        if not inner_str or len(inner_str) < 50:
-            return []
+        if not inner_str:
+            return None
         inner = json.loads(inner_str)
-        if not (isinstance(inner, list) and len(inner) > 4 and inner[4]):
-            return []
-        texts = []
-        for part in inner[4]:
-            if isinstance(part, list) and len(part) > 1 and part[1] and isinstance(part[1], list):
-                for t in part[1]:
-                    if isinstance(t, str) and t:
-                        texts.append(t)
-        return texts
+        return inner if isinstance(inner, list) else None
     except (json.JSONDecodeError, IndexError, TypeError):
+        return None
+
+
+def _extract_texts_from_line(line: str) -> list:
+    """Parse a single wrb.fr line and return list of text strings found."""
+    inner = _parse_inner(line)
+    if not (inner and len(inner) > 4 and inner[4]):
         return []
+    texts = []
+    for part in inner[4]:
+        if isinstance(part, list) and len(part) > 1 and part[1] and isinstance(part[1], list):
+            for t in part[1]:
+                if isinstance(t, str) and t:
+                    texts.append(t)
+    return texts
 
 
 # Generated images come back as lh3.googleusercontent.com/gg-dl/<token> resolver URLs
 # nested in the response. GET-ing a gg-dl URL returns text/plain = the directly
 # viewable rd-gg-dl/<token> image URL (image/jpeg, no auth - just a gemini referer).
 # The text part of an image reply is a useless image_generation_content placeholder,
-# which clean_text strips; we append the resolved image as markdown instead.
+# which clean_text strips; we append the resolved image instead.
 GG_DL_URL_RE = re.compile(r'https://lh3\.googleusercontent\.com/gg-dl/[A-Za-z0-9_-]+')
 
 
@@ -311,16 +363,10 @@ def _find_gg_dl_urls(obj) -> list:
 
 def _extract_image_urls_from_line(line: str) -> list:
     """Parse a wrb.fr line and return any gg-dl image URLs it carries."""
-    if '"wrb.fr"' not in line or len(line) < 200:
+    inner = _parse_inner(line)
+    if inner is None:
         return []
-    try:
-        arr = json.loads(line)
-        inner_str = arr[0][2]
-        if not inner_str:
-            return []
-        return _find_gg_dl_urls(json.loads(inner_str))
-    except (json.JSONDecodeError, IndexError, TypeError):
-        return []
+    return _find_gg_dl_urls(inner)
 
 
 def resolve_image_url(gg_url: str, timeout: int = 15) -> str:
@@ -342,6 +388,19 @@ def resolve_image_url(gg_url: str, timeout: int = 15) -> str:
     except Exception as e:
         log(f"image resolve failed: {e}")
     return gg_url
+
+
+def _format_image_output(url: str) -> str:
+    """Render a generated-image URL the way the client expects it.
+
+    image_format config/env (GEMINI_IMAGE_FORMAT): "markdown" (default) appends
+    an ![generated image](url) line; "url" appends the bare resolved URL, which
+    is easier to consume for clients that do not render markdown.
+    """
+    fmt = str(CONFIG.get("image_format") or "markdown").strip().lower()
+    if fmt in ("url", "link"):
+        return url
+    return f"![generated image]({url})"
 
 
 class GeminiUpstreamError(RuntimeError):
@@ -370,13 +429,16 @@ def bard_error_message(raw: str) -> str:
 
 
 def extract_response_text(raw: str) -> str:
-    """Parse full response to get final text, with generated images as markdown."""
+    """Parse full response to get final text, with generated images appended."""
     last_text = ""
     image_urls = []
     seen = set()
     for line in raw.split("\n"):
         for t in _extract_texts_from_line(line):
-            if len(t) > len(last_text):
+            # Frames grow cumulatively, but Gemini can revise mid-stream: the
+            # LAST frame carries the authoritative draft, so prefer it over the
+            # longest one (which can be a stale middle draft).
+            if t:
                 last_text = t
         for gg in _extract_image_urls_from_line(line):
             if gg not in seen:
@@ -388,12 +450,40 @@ def extract_response_text(raw: str) -> str:
             raise GeminiUpstreamError(err)
     text = clean_text(last_text)
     for gg in image_urls:
-        text += f"\n\n![generated image]({resolve_image_url(gg)})"
+        text += f"\n\n{_format_image_output(resolve_image_url(gg))}"
     return text
 
 
-def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
-    """Non-streaming generation with retry."""
+def extract_finish_status(raw: str):
+    """Best-effort finish status from the final response frame.
+
+    Captures (2026-08-11/14) carry the completion status at
+    inner[26][0][0][0][1][1], always 0 for a normal reply; the text candidate is
+    absent for image-only replies. Returns the int, or None when no frame has one.
+    Only 0 is mapped to "stop" today - other codes are logged by the server so
+    future captures can extend the mapping.
+    """
+    status = None
+    for line in raw.split("\n"):
+        inner = _parse_inner(line)
+        if inner is None or len(inner) <= 26:
+            continue
+        try:
+            s = inner[26][0][0][0][1][1]
+        except (IndexError, TypeError):
+            continue
+        if isinstance(s, int) and not isinstance(s, bool):
+            status = s
+    return status
+
+
+def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None,
+             extra_fields: dict = None, out: dict = None) -> str:
+    """Non-streaming generation with retry.
+
+    `out` is an optional dict filled with extra result info
+    (out["finish_status"]) for callers that want it.
+    """
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
     url = _get_url(file_refs)
     headers = _build_headers()
@@ -413,6 +503,8 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
             else:
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
             raw = resp.read().decode("utf-8", errors="replace")
+            if out is not None:
+                out["finish_status"] = extract_finish_status(raw)
             return extract_response_text(raw)
         except GeminiUpstreamError:
             raise  # Gemini refused the payload; retrying only wastes time.
@@ -449,6 +541,25 @@ def _common_prefix_len(a: str, b: str) -> int:
     return i
 
 
+def _delta_from(emitted: str, t: str) -> str:
+    """Client-visible delta for a new draft `t` given what was already emitted.
+
+    Prefix-grown frames emit the suffix. A mid-stream revision (non-prefix) emits
+    only the part of the new text beyond the longest common prefix, so the stream
+    completes instead of dropping (a drop makes the client retry and concatenate,
+    which repeats the whole intro). Returns "" when nothing new should be sent.
+    """
+    if t == emitted or emitted.startswith(t):
+        return ""
+    if t.startswith(emitted):
+        return clean_text(t[len(emitted):], strip=False)
+    cp = _common_prefix_len(emitted, t)
+    delta = clean_text(t[cp:], strip=False)
+    if delta and delta in emitted:
+        return ""  # the new text is a subset of what was already sent
+    return delta
+
+
 def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None):
     """Streaming generation via httpx with retry on connection failure."""
     if not HAS_HTTPX:
@@ -481,26 +592,14 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                         for t in _extract_texts_from_line(line):
                             if t == emitted_raw_text or emitted_raw_text.startswith(t):
                                 continue
-                            if t.startswith(emitted_raw_text):
-                                delta = clean_text(t[len(emitted_raw_text):], strip=False)
-                            else:
-                                # Gemini revised mid-stream: `t` is not a prefix-extension of
-                                # what we already streamed. SSE deltas are append-only so we
-                                # can't retract the old text; emit only the part of `t` beyond
-                                # the common prefix so the stream completes. Raising here drops
-                                # the stream and makes the client retry and concatenate, which
-                                # repeats the whole intro.
-                                cp = _common_prefix_len(emitted_raw_text, t)
-                                delta = clean_text(t[cp:], strip=False)
-                                if delta and delta in emitted_raw_text:
-                                    delta = ""
+                            delta = _delta_from(emitted_raw_text, t)
                             emitted_raw_text = t
                             if delta:
                                 yield delta
                         for gg in _extract_image_urls_from_line(line):
                             if gg not in emitted_images:
                                 emitted_images.add(gg)
-                                yield f"\n\n![generated image]({resolve_image_url(gg)})\n"
+                                yield f"\n\n{_format_image_output(resolve_image_url(gg))}\n"
             return
         except GeminiUpstreamError:
             raise  # Gemini refused the payload; retrying only wastes time.

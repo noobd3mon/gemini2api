@@ -103,6 +103,22 @@ curl -sS http://127.0.0.1:10012/v1/chat/completions \
   }' | jq
 ```
 
+
+## Push to a running proxy (no restart)
+
+The extension can push the session straight into a running proxy, so you
+do not need the file + jq + restart loop above:
+
+1. Start gemini-web2api with an admin key, e.g.
+   `ADMIN_KEY=your-secret python -m gemini_web2api`
+2. In the extension, enter the proxy URL (e.g. `http://localhost:8081`)
+   and the same `ADMIN_KEY`
+3. Click **Push to proxy**
+
+The proxy applies the cookie, SAPISID, XSRF token, auth_user and gemini_bl
+at runtime via `POST /admin/cookie` and answers with the applied state.
+The URL and key are remembered in `chrome.storage.local`.
+
 ## Keep it secret
 
 `gemini-auth.json` contains a real Google session. Do not share it, print it, or commit it to Git.

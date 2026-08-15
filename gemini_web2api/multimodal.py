@@ -15,6 +15,7 @@ The reference is bound into the StreamGenerate payload as
     inner[0][3] = [[[<file_ref>, 1, None, <mime>], <filename>]]
 """
 import base64
+import json
 import mimetypes
 import re
 import time
@@ -106,11 +107,48 @@ def _get_page_tokens() -> dict:
 _page_tokens_cache = {"tokens": {}, "ts": 0}
 
 
+def _invalidate_page_tokens() -> None:
+    """Force the next token read to re-scrape the app page."""
+    _page_tokens_cache["ts"] = 0
+
+
+def _load_token_cache(path: str):
+    """Read a token cache file written by _cached_page_tokens()."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("tokens"), dict):
+            return data
+    except Exception:
+        pass
+    return None
+
+
 def _cached_page_tokens() -> dict:
+    """Cached app-page tokens, optionally persisted to token_cache_file.
+
+    The cache file is opt-in (GEMINI_TOKEN_CACHE_FILE): at/f_sid are session
+    tokens, so the file is only written when explicitly configured.
+    """
     now = time.time()
-    if now - _page_tokens_cache["ts"] > 600:
-        _page_tokens_cache["tokens"] = _get_page_tokens()
-        _page_tokens_cache["ts"] = now
+    if now - _page_tokens_cache["ts"] <= 600:
+        return _page_tokens_cache["tokens"]
+    cache_file = CONFIG.get("token_cache_file")
+    if cache_file:
+        data = _load_token_cache(cache_file)
+        if data:
+            _page_tokens_cache["tokens"] = data["tokens"]
+            _page_tokens_cache["ts"] = data.get("ts", 0)
+            if now - _page_tokens_cache["ts"] <= 600:
+                return _page_tokens_cache["tokens"]
+    _page_tokens_cache["tokens"] = _get_page_tokens()
+    _page_tokens_cache["ts"] = now
+    if cache_file and _page_tokens_cache["tokens"]:
+        try:
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump({"ts": now, "tokens": _page_tokens_cache["tokens"]}, f)
+        except Exception as e:
+            log(f"Token cache write failed: {e}")
     return _page_tokens_cache["tokens"]
 
 

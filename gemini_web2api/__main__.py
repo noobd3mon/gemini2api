@@ -4,7 +4,7 @@ import os
 
 from .config import CONFIG, load_config, find_config, load_env_config
 from .models import MODELS
-from .gemini import HAS_HTTPX, load_cookie
+from .gemini import HAS_HTTPX, load_cookie, update_bl_if_needed
 from .server import GeminiHandler, ThreadedServer
 from . import __version__
 
@@ -31,6 +31,9 @@ def main():
     if args.proxy:
         CONFIG["proxy"] = args.proxy
 
+    # Keep the StreamGenerate build label fresh; gated by AUTO_UPDATE_BL=false.
+    update_bl_if_needed()
+
     cookie_str, sapisid = load_cookie()
     if CONFIG.get("cookie"):
         cookie_src = "env GEMINI_COOKIE"
@@ -48,8 +51,15 @@ def main():
     print(f"  Config:    {config_path or 'env vars only'}")
     print(f"  Cookie:    {cookie_src}{' + SAPISID' if sapisid else ''}")
     print(f"  API keys:  {len(CONFIG.get('api_keys') or [])} configured")
+    print(f"  Admin key: {'set' if CONFIG.get('admin_key') else 'not set'}")
     print(f"  Proxy:     {CONFIG.get('proxy') or 'system env'}")
     print(f"  Streaming: {'httpx (true streaming)' if HAS_HTTPX else 'urllib (buffered)'}")
+    print(f"  Rate limit: {CONFIG.get('rate_limit', 0)} req/min/key"
+          f"{' (disabled)' if not CONFIG.get('rate_limit') else ''}")
+    print(f"  Image format: {CONFIG.get('image_format', 'markdown')}")
+    print(f"  BL:        {CONFIG['gemini_bl']}"
+          f"{' (auto-update off)' if not CONFIG.get('auto_update_bl', True) else ''}")
+    print(f"  Token cache: {CONFIG.get('token_cache_file') or 'off'}")
     print()
     try:
         server.serve_forever()

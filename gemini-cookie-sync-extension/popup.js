@@ -38,6 +38,9 @@ const LOOKUP_URLS = [
 
 const statusEl = document.getElementById("status");
 const exportButton = document.getElementById("export");
+const pushButton = document.getElementById("push");
+const proxyUrlInput = document.getElementById("proxyUrl");
+const adminKeyInput = document.getElementById("adminKey");
 const inspectButton = document.getElementById("inspect");
 const openButton = document.getElementById("open");
 
@@ -333,6 +336,28 @@ function buildCookieString(info) {
     .join("; ");
 }
 
+function buildPushPayload(info) {
+  return {
+    cookie: buildCookieString(info),
+    sapisid: info.selected.get("SAPISID").value,
+    auth_user: info.authUser,
+    xsrf_token: info.pageMetadata.xsrfToken,
+    gemini_bl: info.pageMetadata.geminiBl
+  };
+}
+
+
+async function loadSettings() {
+  try {
+    const saved = await chrome.storage.local.get(["proxyUrl", "adminKey"]);
+    proxyUrlInput.value = saved.proxyUrl || "http://localhost:8081";
+    adminKeyInput.value = saved.adminKey || "";
+  } catch {
+    // storage unavailable; defaults stay
+  }
+}
+
+
 async function downloadJson(filename, payload) {
   const blob = new Blob([JSON.stringify(payload, null, 2) + "\n"], {
     type: "application/json;charset=utf-8"
@@ -379,14 +404,7 @@ exportButton.addEventListener("click", async () => {
       throw new Error(inspectionMessage(info));
     }
 
-    const cookieString = buildCookieString(info);
-    const payload = {
-      cookie: cookieString,
-      sapisid: info.selected.get("SAPISID").value,
-      auth_user: info.authUser,
-      xsrf_token: info.pageMetadata.xsrfToken,
-      gemini_bl: info.pageMetadata.geminiBl
-    };
+    const payload = buildPushPayload(info);
 
     await downloadJson("gemini-auth.json", payload);
 
@@ -406,3 +424,56 @@ exportButton.addEventListener("click", async () => {
     exportButton.disabled = false;
   }
 });
+
+
+pushButton.addEventListener("click", async () => {
+  pushButton.disabled = true;
+  setStatus("Reading cookies and pushing to the proxy…");
+
+  try {
+    const info = await buildInspection();
+
+    if (!info.validation.valid || !info.pageMetadata.xsrfToken) {
+      throw new Error(inspectionMessage(info));
+    }
+
+    const base = (proxyUrlInput.value || "").trim().replace(/\/+$/, "");
+    if (!base) {
+      throw new Error("Enter the proxy URL first.");
+    }
+
+    const key = adminKeyInput.value.trim();
+    const headers = { "Content-Type": "application/json" };
+    if (key) headers["x-admin-key"] = key;
+
+    const response = await fetch(`${base}/admin/cookie`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(buildPushPayload(info))
+    });
+
+    if (!response.ok) {
+      throw new Error(`Proxy answered ${response.status} ${response.statusText}`);
+    }
+
+    const result = await response.json();
+    await chrome.storage.local.set({ proxyUrl: base, adminKey: key });
+    setStatus(
+      `Pushed to ${base}
+` +
+      `Cookie applied: ${result.cookie ? "yes" : "no"}
+` +
+      `SAPISID: ${result.has_sapisid ? "yes" : "no"}
+` +
+      `gemini_bl: ${result.bl}
+` +
+      `auth_user: ${result.auth_user ?? "default"}`, "ok");
+  } catch (error) {
+    setStatus(error?.message || String(error), "warn");
+  } finally {
+    pushButton.disabled = false;
+  }
+});
+
+
+loadSettings();

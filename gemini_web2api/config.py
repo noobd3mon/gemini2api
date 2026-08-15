@@ -24,6 +24,16 @@ DEFAULT_CONFIG = {
     "api_keys": [],
     "temporary_chats": True,
     "auto_update_bl": True,
+    # Generated images: "markdown" (default, ![generated image](url)) or "url".
+    "image_format": "markdown",
+    # Optional file for the scraped page tokens (push_id/pctx/at/f_sid) so a
+    # restart does not need a fresh app-page scrape. Opt-in: never written by
+    # default because at/f_sid are session tokens.
+    "token_cache_file": None,
+    # Max requests per minute per API key (0 = no limit).
+    "rate_limit": 0,
+    # Optional key for POST /admin/cookie; falls back to api_keys auth.
+    "admin_key": None,
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
@@ -60,6 +70,9 @@ ENV_STR = {
     "xsrf_token": ("GEMINI_XSRF_TOKEN", "XSRF_TOKEN"),
     "default_model": ("GEMINI_DEFAULT_MODEL", "DEFAULT_MODEL"),
     "proxy": ("GEMINI_PROXY", "PROXY"),
+    "image_format": ("GEMINI_IMAGE_FORMAT", "IMAGE_FORMAT"),
+    "token_cache_file": ("GEMINI_TOKEN_CACHE_FILE", "TOKEN_CACHE_FILE"),
+    "admin_key": ("GEMINI_ADMIN_KEY", "ADMIN_KEY"),
 }
 
 ENV_INT = {
@@ -67,6 +80,7 @@ ENV_INT = {
     "retry_attempts": ("RETRY_ATTEMPTS",),
     "retry_delay_sec": ("RETRY_DELAY_SEC",),
     "request_timeout_sec": ("REQUEST_TIMEOUT_SEC",),
+    "rate_limit": ("GEMINI_RATE_LIMIT", "RATE_LIMIT"),
 }
 
 ENV_BOOL = {

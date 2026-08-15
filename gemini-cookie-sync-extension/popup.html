@@ -27,6 +27,7 @@
     }
     button:disabled { opacity: .55; cursor: wait; }
     #export { background: #1769e0; color: white; }
+    #push { background: #0e7a4f; color: white; }
     #inspect, #open { background: color-mix(in srgb, CanvasText 10%, Canvas); color: CanvasText; }
     #status {
       white-space: pre-wrap;
@@ -42,16 +43,33 @@
     .ok { color: #17823b; }
     code { direction: ltr; unicode-bidi: embed; }
     .note { opacity: .78; }
+    label { display: block; font-size: 12px; margin-top: 10px; opacity: .85; }
+    input {
+      width: 100%;
+      box-sizing: border-box;
+      margin-top: 4px;
+      padding: 8px;
+      border: 1px solid color-mix(in srgb, CanvasText 25%, Canvas);
+      border-radius: 6px;
+      background: Canvas;
+      color: CanvasText;
+      font-size: 13px;
+    }
   </style>
 </head>
 <body>
   <h1>Gemini Cookie Sync</h1>
-  <p>Exports cookies, XSRF, and build metadata from the current Gemini session to <code>gemini-auth.json</code>. Nothing is sent over the network.</p>
+  <p>Exports cookies, XSRF, and build metadata from the current Gemini session to <code>gemini-auth.json</code>, or pushes the session straight into a running gemini-web2api proxy.</p>
   <button id="open" type="button">Open Gemini</button>
   <button id="inspect" type="button">Inspect session</button>
   <button id="export" type="button">Export gemini-auth.json</button>
+  <label for="proxyUrl">Proxy URL (for push)</label>
+  <input id="proxyUrl" type="text" placeholder="http://localhost:8081" autocomplete="off">
+  <label for="adminKey">Admin key (ADMIN_KEY of the proxy, optional)</label>
+  <input id="adminKey" type="password" placeholder="admin key" autocomplete="off">
+  <button id="push" type="button">Push to proxy</button>
   <p id="status">Ready.</p>
-  <p class="note">Open Gemini, sign in, then refresh the page before inspection. The generated file contains highly sensitive session data; do not share it or commit it to Git.</p>
+  <p class="note">Open Gemini, sign in, then refresh the page before inspection. The session data is highly sensitive: the proxy connection must be yours, and never commit the exported file to Git.</p>
   <script src="popup.js"></script>
 </body>
 </html>
