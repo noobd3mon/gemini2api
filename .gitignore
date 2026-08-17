@@ -7,3 +7,8 @@ cookie.json
 .idea
 .DS_Store
 gemini-auth.json
+
+# Local working artifacts (captures contain live cookies - never commit)
+Capture mẫu/
+.mcp-backups/
+.zcode/

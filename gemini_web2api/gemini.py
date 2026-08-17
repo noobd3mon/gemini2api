@@ -46,7 +46,20 @@ def _get_httpx_client():
 
 
 def load_cookie() -> tuple:
-    """Load cookie from file with mtime-based caching."""
+    """Load the Gemini cookie.
+
+    An inline cookie (CONFIG["cookie"], usually from the GEMINI_COOKIE env var)
+    is preferred and parsed in memory; cookie_file is a file-based fallback with
+    mtime-based caching. Returns (cookie_str, sapisid).
+    """
+    inline = (CONFIG.get("cookie") or "").strip()
+    if inline.startswith('"') and inline.endswith('"'):
+        inline = inline[1:-1].strip()
+    if inline:
+        pairs = dict(p.split("=", 1) for p in inline.split("; ") if "=" in p)
+        sapisid = CONFIG.get("sapisid") or pairs.get("SAPISID")
+        return inline, sapisid or None
+
     cookie_file = CONFIG.get("cookie_file")
     if not cookie_file or not os.path.exists(cookie_file):
         return "", None

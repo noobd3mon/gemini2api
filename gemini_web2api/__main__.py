@@ -2,7 +2,7 @@
 import argparse
 import os
 
-from .config import CONFIG, load_config, find_config
+from .config import CONFIG, load_config, load_env_config, find_config
 from .models import MODELS
 from .gemini import HAS_HTTPX
 from .server import GeminiHandler, ThreadedServer
@@ -18,9 +18,11 @@ def main():
     parser.add_argument("--version", action="version", version=f"gemini-web2api {__version__}")
     args = parser.parse_args()
 
+    # Precedence: DEFAULT_CONFIG < config.json < environment variables < CLI flags.
     config_path = args.config or os.environ.get("GEMINI_WEB2API_CONFIG") or find_config()
     if config_path:
         load_config(config_path)
+    load_env_config()
 
     if args.port:
         CONFIG["port"] = args.port
@@ -35,7 +37,13 @@ def main():
     print(f"  Listening: http://0.0.0.0:{port}")
     print(f"  Base URL:  http://localhost:{port}/v1")
     print(f"  Models:    {', '.join(MODELS.keys())}")
-    print(f"  Cookie:    {'yes' if CONFIG.get('cookie_file') else 'none (anonymous)'}")
+    if CONFIG.get("cookie"):
+        cookie_src = "env GEMINI_COOKIE"
+    elif CONFIG.get("cookie_file"):
+        cookie_src = f"file {CONFIG['cookie_file']}"
+    else:
+        cookie_src = "none (anonymous)"
+    print(f"  Cookie:    {cookie_src}")
     print(f"  Proxy:     {CONFIG.get('proxy') or 'system env'}")
     print(f"  Streaming: {'httpx (true streaming)' if HAS_HTTPX else 'urllib (buffered)'}")
     print(f"  Temporary: {'yes' if CONFIG.get('temporary_chats', False) else 'no'}")

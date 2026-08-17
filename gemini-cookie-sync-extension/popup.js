@@ -38,6 +38,7 @@ const LOOKUP_URLS = [
 
 const statusEl = document.getElementById("status");
 const exportButton = document.getElementById("export");
+const copyEnvButton = document.getElementById("copyEnv");
 const inspectButton = document.getElementById("inspect");
 const openButton = document.getElementById("open");
 
@@ -333,6 +334,32 @@ function buildCookieString(info) {
     .join("; ");
 }
 
+// Build a KEY=value env block ready to paste into Railway's
+// Variables > Raw Editor (or any .env loader). Fills the scraped session
+// values (cookie, XSRF, bl, auth_user) and the rest with the documented
+// defaults from .env.example. PORT is intentionally omitted (Railway injects it).
+function buildRailwayEnv(info) {
+  const lines = [`GEMINI_COOKIE=${buildCookieString(info)}`];
+
+  const xsrf = info.pageMetadata.xsrfToken;
+  if (xsrf) lines.push(`GEMINI_XSRF_TOKEN=${xsrf}`);
+
+  const bl = info.pageMetadata.geminiBl;
+  if (bl) lines.push(`GEMINI_BL=${bl}`);
+
+  if (info.authUser != null) lines.push(`GEMINI_AUTH_USER=${info.authUser}`);
+
+  lines.push(
+    "API_KEYS=sk-gemini",
+    "HOST=0.0.0.0",
+    "DEFAULT_MODEL=gemini-3.6-flash",
+    "LOG_REQUESTS=true",
+    "TEMPORARY_CHATS=false"
+  );
+
+  return lines.join("\n");
+}
+
 async function downloadJson(filename, payload) {
   const blob = new Blob([JSON.stringify(payload, null, 2) + "\n"], {
     type: "application/json;charset=utf-8"
@@ -404,5 +431,41 @@ exportButton.addEventListener("click", async () => {
     setStatus(error?.message || String(error), "warn");
   } finally {
     exportButton.disabled = false;
+  }
+});
+
+copyEnvButton.addEventListener("click", async () => {
+  copyEnvButton.disabled = true;
+  setStatus("Reading session for Railway env…");
+
+  try {
+    const info = await buildInspection();
+
+    if (!info.validation.valid || !info.pageMetadata.xsrfToken) {
+      throw new Error(inspectionMessage(info));
+    }
+
+    const env = buildRailwayEnv(info);
+    let copied = false;
+    try {
+      await navigator.clipboard.writeText(env);
+      copied = true;
+    } catch {
+      // Clipboard write can be blocked (focus / permissions); the text
+      // below is selectable so the user can copy it manually.
+    }
+
+    setStatus(
+      (copied
+        ? "Copied Railway env to clipboard.\n"
+        : "Clipboard blocked — select the text below to copy.\n") +
+      "Paste into Railway > Variables > Raw Editor, then deploy.\n\n" +
+      env,
+      "ok"
+    );
+  } catch (error) {
+    setStatus(error?.message || String(error), "warn");
+  } finally {
+    copyEnvButton.disabled = false;
   }
 });

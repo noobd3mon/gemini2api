@@ -4,7 +4,8 @@ Purpose:
 - Read cookies for the current Google/Gemini session.
 - Extract the XSRF token named SNlM0e from the Gemini page.
 - Extract gemini_bl from cfb2h or from page requests when available.
-- Export `gemini-auth.json` locally only.
+- Copy a Railway-ready KEY=value env block (paste into Variables > Raw Editor),
+  or export `gemini-auth.json` locally. Nothing is sent over the network.
 
 Installation:
 1. Open `chrome://extensions`
@@ -13,7 +14,14 @@ Installation:
 4. Select this folder
 5. Open `https://gemini.google.com/app`, sign in, and refresh the page
 6. Click Inspect session
-7. Click Export `gemini-auth.json`
+7. Click Copy Railway env (raw), or click Export `gemini-auth.json`
+
+Copy Railway env:
+With a ready session, click "Copy Railway env (raw)". The extension copies a
+KEY=value block to the clipboard (shown in the panel if the clipboard is
+blocked). Paste it into Railway > Variables > Raw Editor and apply. Only the
+scraped values (cookie, XSRF, bl, auth_user) are filled in; the rest are the
+documented defaults. PORT is omitted because Railway injects it.
 
 Security:
 The generated file represents the real Google session and must be treated as secret. Do not send it, print it, or commit it to Git.

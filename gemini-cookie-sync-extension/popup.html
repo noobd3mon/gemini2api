@@ -27,6 +27,7 @@
     }
     button:disabled { opacity: .55; cursor: wait; }
     #export { background: #1769e0; color: white; }
+    #copyEnv { background: #5b21b6; color: white; }
     #inspect, #open { background: color-mix(in srgb, CanvasText 10%, Canvas); color: CanvasText; }
     #status {
       white-space: pre-wrap;
@@ -46,9 +47,10 @@
 </head>
 <body>
   <h1>Gemini Cookie Sync</h1>
-  <p>Exports cookies, XSRF, and build metadata from the current Gemini session to <code>gemini-auth.json</code>. Nothing is sent over the network.</p>
+  <p>Exports cookies, XSRF, and build metadata from the current Gemini session. Copy them as a Railway-ready <code>KEY=value</code> env block (paste into Variables &gt; Raw Editor) or save <code>gemini-auth.json</code>. Nothing is sent over the network.</p>
   <button id="open" type="button">Open Gemini</button>
   <button id="inspect" type="button">Inspect session</button>
+  <button id="copyEnv" type="button">Copy Railway env (raw)</button>
   <button id="export" type="button">Export gemini-auth.json</button>
   <p id="status">Ready.</p>
   <p class="note">Open Gemini, sign in, then refresh the page before inspection. The generated file contains highly sensitive session data; do not share it or commit it to Git.</p>
