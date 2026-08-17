@@ -12,7 +12,8 @@ The extension reads the current signed-in Gemini session and exports:
 - `cfb2h` (`gemini_bl`)
 - `auth_user`
 
-It saves them locally as `gemini-auth.json`.
+It saves them locally as `gemini-auth.json`, or copies them as a Railway-ready
+`KEY=value` env block (see *Deploy to Railway* below).
 
 ## Install and export
 
@@ -33,6 +34,34 @@ XSRF / SNlM0e: present
 gemini_bl / cfb2h: present
 Session and XSRF are ready for export.
 ```
+
+## Deploy to Railway (raw env)
+
+Fastest path to a Railway deploy — no file, no `jq`, no restart loop:
+
+1. With the session ready (above), click **Copy Railway env (raw)**.
+2. The extension copies a `KEY=value` block to the clipboard (and shows it in
+   the panel, selectable, if the clipboard is blocked). It looks like:
+
+   ```dotenv
+   GEMINI_COOKIE=__Secure-1PSID=...; __Secure-1PSIDTS=...; SAPISID=...
+   GEMINI_XSRF_TOKEN=<SNlM0e>
+   GEMINI_BL=<cfb2h>
+   GEMINI_AUTH_USER=0
+   API_KEYS=sk-gemini
+   HOST=0.0.0.0
+   DEFAULT_MODEL=gemini-3.6-flash
+   LOG_REQUESTS=true
+   TEMPORARY_CHATS=false
+   AUTO_UPDATE_BL=true
+   ```
+
+   Only the scraped values are filled in; the rest are the documented defaults
+   from `.env.example`. `PORT` is omitted because Railway injects it. Edit
+   `API_KEYS` (and any knob) before deploying.
+
+3. In Railway, open your service **> Variables > Raw Editor**, paste the block,
+   and apply it. Railway reads each `KEY=value` line directly.
 
 ## Apply it in `gemini-web2api`
 

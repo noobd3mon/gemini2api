@@ -4,7 +4,8 @@ Purpose:
 - Read cookies for the current Google/Gemini session.
 - Extract the XSRF token named SNlM0e from the Gemini page.
 - Extract gemini_bl from cfb2h or from page requests when available.
-- Export `gemini-auth.json` locally, or push the session straight to a
+- Copy a Railway-ready KEY=value env block (paste into Variables > Raw Editor),
+  export `gemini-auth.json` locally, or push the session straight to a
   running gemini-web2api proxy via POST /admin/cookie.
 
 Installation:
@@ -14,7 +15,15 @@ Installation:
 4. Select this folder
 5. Open `https://gemini.google.com/app`, sign in, and refresh the page
 6. Click Inspect session
-7. Export `gemini-auth.json`, or enter the proxy URL and click Push to proxy
+7. Click Copy Railway env (raw), export `gemini-auth.json`, or enter the
+   proxy URL and click Push to proxy
+
+Copy Railway env:
+With a ready session, click "Copy Railway env (raw)". The extension copies a
+KEY=value block to the clipboard (shown in the panel if the clipboard is
+blocked). Paste it into Railway > Variables > Raw Editor and apply. Only the
+scraped values (cookie, XSRF, bl, auth_user) are filled in; the rest are the
+documented defaults. PORT is omitted because Railway injects it.
 
 Push to proxy:
 The proxy must be running with ADMIN_KEY set (recommended) or with API-key

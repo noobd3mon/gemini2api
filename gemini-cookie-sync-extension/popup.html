@@ -27,6 +27,7 @@
     }
     button:disabled { opacity: .55; cursor: wait; }
     #export { background: #1769e0; color: white; }
+    #copyEnv { background: #5b21b6; color: white; }
     #push { background: #0e7a4f; color: white; }
     #inspect, #open { background: color-mix(in srgb, CanvasText 10%, Canvas); color: CanvasText; }
     #status {
@@ -59,9 +60,10 @@
 </head>
 <body>
   <h1>Gemini Cookie Sync</h1>
-  <p>Exports cookies, XSRF, and build metadata from the current Gemini session to <code>gemini-auth.json</code>, or pushes the session straight into a running gemini-web2api proxy.</p>
+  <p>Exports cookies, XSRF, and build metadata from the current Gemini session. Copy them as a Railway-ready <code>KEY=value</code> env block (paste into Variables &gt; Raw Editor), save <code>gemini-auth.json</code>, or push the session straight into a running gemini-web2api proxy.</p>
   <button id="open" type="button">Open Gemini</button>
   <button id="inspect" type="button">Inspect session</button>
+  <button id="copyEnv" type="button">Copy Railway env (raw)</button>
   <button id="export" type="button">Export gemini-auth.json</button>
   <label for="proxyUrl">Proxy URL (for push)</label>
   <input id="proxyUrl" type="text" placeholder="http://localhost:8081" autocomplete="off">
