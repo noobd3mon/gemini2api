@@ -5,12 +5,13 @@ import uuid
 import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
+from concurrent.futures import ThreadPoolExecutor
 
 from .config import CONFIG
 from .models import MODELS, resolve_model
-from .gemini import generate, generate_stream, log
+from .gemini import generate, generate_stream, load_cookie, log
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
-from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
+from .multimodal import upload_file, prepare_attachment, _cached_page_tokens
 from . import __version__
 
 
@@ -20,27 +21,52 @@ def _usage(prompt: str, text: str) -> dict:
     return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}
 
 
-def _upload_images(images: list) -> list:
-    """Upload images and return list of file references. Returns None if no images."""
-    if not images:
+def _upload_attachments(attachments: list) -> list:
+    """Upload images/files, returning [(file_ref, filename, mime), ...] or None.
+
+    Accepts the (data_or_url, mime, filename) tuples produced by the prompt
+    converters; remote URLs are fetched and data: URLs decoded before upload.
+    Several attachments are uploaded concurrently, the way the web client fires
+    its start requests; the result keeps attachment order because Gemini reads
+    the payload bindings in that order. Failed attachments are skipped, but when
+    every attachment fails a RuntimeError is raised so the caller can return a
+    502 instead of silently generating without the files the user sent.
+    """
+    if not attachments:
         return None
-    file_refs = []
-    for item in images:
-        if not (isinstance(item, tuple) and len(item) == 2):
-            continue
-        data, mime = item
-        if isinstance(data, str):
-            data = fetch_image_bytes(data)
-            mime = mime or "image/png"
-        if not data:
-            raise RuntimeError("image fetch failed")
-        mime = detect_image_mime(data, mime or "image/png")
+    if not load_cookie()[0]:
+        log("Attachments without GEMINI_COOKIE: Gemini only accepts files on a signed-in session")
+    errors = []
+
+    def run(pair):
+        index, item = pair
         try:
-            ref = upload_image(data, "image.png", mime or "image/png")
-            file_refs.append(ref)
+            prepared = prepare_attachment(item, index)
+            if not prepared:
+                errors.append(f"attachment {index + 1}: unusable input")
+                return None
+            data, filename, mime = prepared
+            return (upload_file(data, filename, mime), filename, mime)
         except Exception as e:
-            raise RuntimeError(f"image upload failed: {e}") from e
-    return file_refs if file_refs else None
+            errors.append(f"attachment {index + 1}: {e}")
+            return None
+
+    if len(attachments) == 1:
+        results = [run((0, attachments[0]))]
+    else:
+        # Warm the shared token cache once so the workers do not all scrape the app page.
+        _cached_page_tokens()
+        with ThreadPoolExecutor(max_workers=min(4, len(attachments))) as pool:
+            results = list(pool.map(run, enumerate(attachments)))
+
+    file_refs = [r for r in results if r]
+    if not file_refs:
+        raise RuntimeError("attachment upload failed: " + "; ".join(errors))
+    return file_refs
+
+
+# Backwards-compatible alias for the previous image-only helper name.
+_upload_images = _upload_attachments
 
 
 class GeminiHandler(BaseHTTPRequestHandler):
@@ -140,7 +166,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     for n, c in MODELS.items()
                 ]})
             elif self.path == "/":
-                self.send_json({"status": "ok", "version": __version__, "models": list(MODELS.keys())})
+                self.send_json({"status": "ok", "version": __version__, "models": list(MODELS.keys()),
+                                "cookie": bool(load_cookie()[0])})
             else:
                 self.send_json({"error": "not found"}, 404)
         except (BrokenPipeError, ConnectionResetError):
@@ -194,7 +221,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         stream = req.get("stream", False)
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         try:
-            file_refs = _upload_images(images)
+            file_refs = _upload_attachments(images)
         except RuntimeError as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -324,7 +351,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            file_refs = _upload_images(images)
+            file_refs = _upload_attachments(images)
             text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
@@ -508,7 +535,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            file_refs = _upload_images(images)
+            file_refs = _upload_attachments(images)
         except RuntimeError as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return

@@ -1315,7 +1315,9 @@ function extractResponseText(raw) {
   // 第一步：检查 BardErrorInfo 错误
   // 格式: BardErrorInfo [错误代码]
   // 例如: BardErrorInfo [10] 表示请求被拒绝
-  var bardErr = raw.match(/BardErrorInfo\s*\[(\d+)\]/);
+  // Real responses look like `...BardErrorInfo",[1100]]]`, so allow the
+  // quote/comma - the strict `BardErrorInfo [n]` form never matches.
+  var bardErr = raw.match(/BardErrorInfo\D{0,8}\[\s*(\d+)/);
   if (bardErr) {
     throw new Error('Gemini upstream rejected request: BardErrorInfo [' + bardErr[1] + ']');
   }

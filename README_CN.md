@@ -221,10 +221,31 @@ python gemini_web2api.py
 
 支持 Clash, V2Ray, Shadowsocks 等任何 HTTP 代理.
 
-## 图片输入
+## 图片与文件输入
 
 Chat Completions 和 Responses API 支持 OpenAI 风格的多模态消息。图片可以使用
-HTTP(S) URL 或 base64 data URL:
+HTTP(S) URL 或 base64 data URL; 文档 (PDF、文本等) 通过 `file` / `input_file`
+部分接受 base64 或 URL, Google 原生 `inlineData` / `fileData` 部分在
+`/v1beta` 端点同样有效:
+
+```python
+resp = client.chat.completions.create(
+    model="gemini-3.6-flash",
+    messages=[{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "描述这张图片"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}},
+            {"type": "file", "file": {"filename": "notes.pdf",
+                                      "file_data": "data:application/pdf;base64,<...>"}}
+        ]
+    }]
+)
+```
+
+附件通过 Gemini 网页端的 Scotty 断点续传接口 (push.clients6.google.com) 上传,
+并以与网页端相同的方式绑定到聊天载荷中。
+
 
 ```python
 resp = client.chat.completions.create(
@@ -241,7 +262,7 @@ resp = client.chat.completions.create(
 
 ## 已知限制
 
-- **图片上传可能需要 Cookie**: 多模态输入使用 Gemini 网页端图片上传接口。匿名上传失败时, 请配置 Gemini cookie。
+- **附件需要登录 Cookie**: 文件/图片输入使用 Gemini 网页端上传接口; 无 `GEMINI_COOKIE` 时上传成功但生成会被拒绝 (BardErrorInfo 1100)。纯文本请求仍然可以匿名使用。
 - **Pro/Ultra 非真实路由**: 无付费订阅 cookie 时, `gemini-3.1-pro` 实际路由到 Flash 模型. "Pro" 只是 UI 偏好标签.
 - **单轮对话**: 每次请求是独立对话, 多轮上下文通过在 prompt 中包含历史消息模拟.
 - **频率限制**: Google 可能限制高频请求, server 会自动重试但持续高负载可能被封.

@@ -10,16 +10,19 @@ import time
 import uuid
 import re
 import urllib.request
+import urllib.error
 import urllib.parse
 import ssl
 import hashlib
+import mimetypes
 import base64
-from urllib.parse import urlparse
+import ipaddress
+import socket
 import binascii
-import io
 from urllib.parse import unquote_to_bytes
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
+from concurrent.futures import ThreadPoolExecutor
 import argparse
 
 try:
@@ -250,6 +253,8 @@ def resolve_model(model_name: str, default: str = "gemini-3.6-flash"):
 
 
 
+
+
 try:
     import httpx
     HAS_HTTPX = True
@@ -338,6 +343,27 @@ def _account_prefix() -> str:
     return f"/u/{auth_user}"
 
 
+def _page_token(name: str):
+    """Read a scraped Gemini app-page token (push_id/pctx/at/f_sid).
+
+    The tokens live in multimodal._cached_page_tokens(). In the package the
+    name comes from a relative import; in the merged single file it is a
+    shared global, so try the global first and fall back (the build strips
+    relative import lines, so it must never stand alone as a block body).
+    The cache is warmed by the upload step, so this is a cache hit for
+    attachment requests and costs nothing (no fetch) for text-only ones.
+    """
+    try:
+        return _cached_page_tokens().get(name)
+    except NameError:
+        try:
+            return _cached_page_tokens().get(name)
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
 def _build_headers() -> dict:
     account_prefix = _account_prefix()
     headers = {
@@ -357,6 +383,34 @@ def _build_headers() -> dict:
     return headers
 
 
+def _build_file_bindings(file_refs: list) -> list:
+    """Bind uploaded files into payload slot inner[0][3].
+
+    Verified against real gemini.google.com captures (2026-08-11):
+        [[[<file_ref>, <kind>, None, <mime>], <filename>], ...]
+    <kind> is 1 for images and 3 for any other file type: a 3-file capture sent
+    1 for image/png and image/jpeg, but 3 for text/plain.
+    Accepts bare refs or (ref, filename, mime) tuples.
+    """
+    if not file_refs:
+        return None
+    bindings = []
+    for i, item in enumerate(file_refs):
+        if isinstance(item, (list, tuple)):
+            parts = list(item) + [None] * (3 - len(item))
+            ref, filename, mime = parts[0], parts[1], parts[2]
+        else:
+            ref, filename, mime = item, None, None
+        if not ref:
+            continue
+        if not mime and filename:
+            mime = mimetypes.guess_type(filename)[0]
+        mime = mime or "application/octet-stream"
+        kind = 1 if mime.startswith("image/") else 3
+        bindings.append([[ref, kind, None, mime], filename or f"file_{i}"])
+    return bindings or None
+
+
 def _apply_chat_persistence_flags(inner: list) -> None:
     """Apply Gemini Web persistence flags to an outgoing request payload."""
     if CONFIG.get("temporary_chats", False):
@@ -369,11 +423,7 @@ def _apply_chat_persistence_flags(inner: list) -> None:
 
 def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
     inner = [None] * 102
-    if file_refs:
-        refs = [[None, None, ref] for ref in file_refs]
-        inner[0] = [prompt, 0, None, refs, None, None, 0]
-    else:
-        inner[0] = [prompt, 0, None, None, None, None, 0]
+    inner[0] = [prompt, 0, None, _build_file_bindings(file_refs), None, None, 0]
     inner[1] = ["en"]
     inner[2] = ["", "", "", None, None, None, None, None, None, ""]
     inner[6] = [0]
@@ -397,17 +447,31 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
     params = {"f.req": json.dumps(outer)}
     if CONFIG.get("xsrf_token"):
         params["at"] = CONFIG["xsrf_token"]
+    elif file_refs:
+        # The browser always sends an `at` XSRF token; use the one scraped from
+        # the app page (already cached by the upload step). Text-only requests
+        # are tolerated without it, so only attach it for file-bearing calls.
+        at = _page_token("at")
+        if at:
+            params["at"] = at
     return urllib.parse.urlencode(params)
 
 
-def _get_url() -> str:
+def _get_url(file_refs: list = None) -> str:
     reqid = int(time.time()) % 1000000
     account_prefix = _account_prefix()
-    return (
+    url = (
         f"https://gemini.google.com{account_prefix}/_/BardChatUi/data/"
         "assistant.lamda.BardFrontendService/StreamGenerate"
         f"?bl={CONFIG['gemini_bl']}&hl=en&_reqid={reqid}&rt=c"
     )
+    # The browser always sends f.sid; only attach it for file-bearing calls so
+    # text-only requests stay cheap (no page scrape needed).
+    if file_refs:
+        fsid = _page_token("f_sid")
+        if fsid:
+            url += f"&f.sid={fsid}"
+    return url
 
 
 def clean_text(text: str, strip: bool = True) -> str:
@@ -442,23 +506,49 @@ def _extract_texts_from_line(line: str) -> list:
         return []
 
 
+class GeminiUpstreamError(RuntimeError):
+    """Gemini refused the request itself; resending the same payload will not help."""
+
+
+# Real responses look like `...BardErrorInfo",[1100]]]`, so allow the quote/comma.
+BARD_ERROR_RE = re.compile(r'BardErrorInfo\D{0,8}\[\s*(\d+)')
+
+
+def bard_error_message(raw: str) -> str:
+    """Describe a BardErrorInfo code, with a hint for the common attachment failure."""
+    match = BARD_ERROR_RE.search(raw)
+    if not match:
+        return ""
+    code = match.group(1)
+    msg = f"Gemini upstream rejected request: BardErrorInfo [{code}]"
+    if code == "1100":
+        if load_cookie()[0]:
+            msg += (" - the attachment was refused. The cookie is most likely expired"
+                    " or has no file access; refresh GEMINI_COOKIE and retry.")
+        else:
+            msg += (" - file/image input needs a signed-in session. Set GEMINI_COOKIE;"
+                    " anonymous requests can only send text.")
+    return msg
+
+
 def extract_response_text(raw: str) -> str:
     """Parse full response to get final text."""
-    bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', raw)
-    if bard_err:
-        raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]")
     last_text = ""
     for line in raw.split("\n"):
         for t in _extract_texts_from_line(line):
             if len(t) > len(last_text):
                 last_text = t
+    if not last_text:
+        err = bard_error_message(raw)
+        if err:
+            raise GeminiUpstreamError(err)
     return clean_text(last_text)
 
 
 def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
     """Non-streaming generation with retry."""
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
-    url = _get_url()
+    url = _get_url(file_refs)
     headers = _build_headers()
     ctx = _get_ssl_ctx()
     proxy = CONFIG.get("proxy")
@@ -477,6 +567,24 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
             raw = resp.read().decode("utf-8", errors="replace")
             return extract_response_text(raw)
+        except GeminiUpstreamError:
+            raise  # Gemini refused the payload; retrying only wastes time.
+        except urllib.error.HTTPError as e:
+            # 4xx (other than 405) is a permanent rejection - surface Gemini's
+            # body so the cause can be diagnosed instead of silently retrying.
+            if 400 <= e.code < 500 and e.code != 405:
+                snippet = ""
+                try:
+                    snippet = e.read().decode("utf-8", errors="replace")[:400]
+                except Exception:
+                    pass
+                raise GeminiUpstreamError(
+                    f"StreamGenerate HTTP {e.code} {e.reason}"
+                    + (f": {snippet}" if snippet else ""))
+            last_err = e
+            if attempt < CONFIG["retry_attempts"] - 1:
+                log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
+                time.sleep(CONFIG["retry_delay_sec"])
         except Exception as e:
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:
@@ -494,7 +602,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
         return
 
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
-    url = _get_url()
+    url = _get_url(file_refs)
     headers = _build_headers()
     client = _get_httpx_client()
 
@@ -507,12 +615,10 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                 buf = ""
                 for chunk in resp.iter_text():
                     buf += chunk
-                    if "BardErrorInfo" in buf:
-                        bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', buf)
-                        if bard_err:
-                            raise RuntimeError(
-                                f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]"
-                            )
+                    if "BardErrorInfo" in buf and not emitted_raw_text:
+                        err = bard_error_message(buf)
+                        if err:
+                            raise GeminiUpstreamError(err)
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
                         for t in _extract_texts_from_line(line):
@@ -525,6 +631,23 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                             if delta:
                                 yield delta
             return
+        except GeminiUpstreamError:
+            raise  # Gemini refused the payload; retrying only wastes time.
+        except httpx.HTTPStatusError as e:
+            code = e.response.status_code
+            if 400 <= code < 500 and code != 405:
+                snippet = ""
+                try:
+                    snippet = e.response.read().decode("utf-8", errors="replace")[:400]
+                except Exception:
+                    pass
+                raise GeminiUpstreamError(
+                    f"StreamGenerate HTTP {code}"
+                    + (f": {snippet}" if snippet else ""))
+            last_err = e
+            if attempt < CONFIG["retry_attempts"] - 1:
+                log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
+                time.sleep(CONFIG["retry_delay_sec"])
         except Exception as e:
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:
@@ -544,58 +667,62 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
 
 
 
+# push.clients6 is what the web client uses; content-push is the public alias.
+UPLOAD_ENDPOINTS = (
+    "https://push.clients6.google.com/upload/",
+    "https://content-push.googleapis.com/upload/",
+)
 
-def _get_page_tokens() -> dict:
-    """Fetch WIZ_global_data tokens from Gemini page (Push-ID, X-Client-Pctx)."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    }
-    cookie_str, sapisid = load_cookie()
-    if cookie_str:
-        headers["Cookie"] = cookie_str
-    if sapisid:
-        headers["Authorization"] = make_sapisidhash(sapisid)
-    try:
-        req = urllib.request.Request("https://gemini.google.com/app", headers=headers)
-        proxy = CONFIG.get("proxy")
-        if proxy:
-            opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
-                urllib.request.HTTPSHandler(context=_get_ssl_ctx()),
-            )
-            resp = opener.open(req, timeout=30)
-        else:
-            resp = urllib.request.urlopen(req, context=_get_ssl_ctx(), timeout=30)
-        html = resp.read().decode()
-        tokens = {}
-        for key, pattern in [
-            ("push_id", r'"qKIAYe":"([^"]+)"'),
-            ("pctx", r'"Ylro7b":"([^"]+)"'),
-            ("at", r'"thykhd":"([^"]+)"'),
-        ]:
-            m = re.search(pattern, html)
-            if m:
-                tokens[key] = m.group(1)
-        return tokens
-    except Exception as e:
-        log(f"Page token fetch failed: {e}")
-        return {}
+DEFAULT_PUSH_ID = "feeds/mcudyrk2a4khkz"
+DEFAULT_PCTX = "CgcSBWjK7pYx"
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
 
-_page_tokens_cache = {"tokens": {}, "ts": 0}
+def _open(req, timeout):
+    """Open a request honouring the configured proxy."""
+    ctx = _get_ssl_ctx()
+    proxy = CONFIG.get("proxy")
+    if proxy:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+            urllib.request.HTTPSHandler(context=ctx),
+        )
+        return opener.open(req, timeout=timeout)
+    return urllib.request.urlopen(req, context=ctx, timeout=timeout)
 
 
-def _cached_page_tokens() -> dict:
-    now = time.time()
-    if now - _page_tokens_cache["ts"] > 600:
-        _page_tokens_cache["tokens"] = _get_page_tokens()
-        _page_tokens_cache["ts"] = now
-    return _page_tokens_cache["tokens"]
+def guess_mime(filename: str, fallback: str = "application/octet-stream") -> str:
+    mime, _enc = mimetypes.guess_type(filename or "")
+    return mime or fallback
+
+
+def guess_filename(mime: str, index: int = 0) -> str:
+    ext = mimetypes.guess_extension(mime or "") or ".bin"
+    if ext == ".jpe":
+        ext = ".jpg"
+    kind = "image" if (mime or "").startswith("image/") else "file"
+    return f"{kind}_{int(time.time())}_{index}{ext}"
+
+
+def decode_data_url(url: str):
+    """Return (bytes, mime) for a data: URL, or (b"", "") when it is not one."""
+    if not isinstance(url, str) or not url.startswith("data:"):
+        return b"", ""
+    header, _sep, payload = url.partition(",")
+    mime = header[5:].split(";")[0].strip()
+    if ";base64" in header:
+        try:
+            return base64.b64decode(payload), mime
+        except Exception as e:
+            log(f"Invalid base64 data URL: {e}")
+            return b"", mime
+    return urllib.parse.unquote_to_bytes(payload), mime
 
 
 def detect_image_mime(image_bytes: bytes, fallback: str = "image/png") -> str:
     """Infer a common raster image MIME type from its file signature."""
-    if not isinstance(image_bytes, bytes):
+    if not isinstance(image_bytes, (bytes, bytearray)):
         return fallback
     if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
         return "image/png"
@@ -618,94 +745,204 @@ def detect_image_mime(image_bytes: bytes, fallback: str = "image/png") -> str:
     return fallback
 
 
-def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str = "image/png") -> str:
-    """Upload image via Scotty resumable upload. Returns file reference path."""
-    tokens = _cached_page_tokens()
-    push_id = tokens.get("push_id", "feeds/mcudyrk2a4khkz")
-    pctx = tokens.get("pctx", "CgcSBWjK7pYx")
+def _get_page_tokens() -> dict:
+    """Fetch WIZ_global_data tokens from the Gemini page.
 
+    Scrapes Push-ID (qKIAYe), X-Client-Pctx (Ylro7b), XSRF `at` (thykhd) and
+    f.sid (FdrFJe); the latter two are required on file-bearing StreamGenerate
+    requests, the way the web client always sends them.
+    """
+    headers = {"User-Agent": UA}
     cookie_str, sapisid = load_cookie()
-    ctx = _get_ssl_ctx()
-    proxy = CONFIG.get("proxy")
+    if cookie_str:
+        headers["Cookie"] = cookie_str
+    if sapisid:
+        headers["Authorization"] = make_sapisidhash(sapisid)
+    url = "https://gemini.google.com" + _account_prefix() + "/app"
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        html = _open(req, 30).read().decode("utf-8", errors="replace")
+        tokens = {}
+        for key, pattern in (
+            ("push_id", r'"qKIAYe":"([^"]+)"'),
+            ("pctx", r'"Ylro7b":"([^"]+)"'),
+            ("at", r'"thykhd":"([^"]+)"'),
+            ("f_sid", r'"FdrFJe":"([^"]+)"'),
+        ):
+            m = re.search(pattern, html)
+            if m:
+                tokens[key] = m.group(1)
+        return tokens
+    except Exception as e:
+        log(f"Page token fetch failed: {e}")
+        return {}
 
-    # Step 1: Initiate resumable upload
-    start_headers = {
+
+_page_tokens_cache = {"tokens": {}, "ts": 0}
+
+
+def _cached_page_tokens() -> dict:
+    now = time.time()
+    if now - _page_tokens_cache["ts"] > 600:
+        _page_tokens_cache["tokens"] = _get_page_tokens()
+        _page_tokens_cache["ts"] = now
+    return _page_tokens_cache["tokens"]
+
+
+def upload_file(data: bytes, filename: str = None, mime_type: str = None) -> str:
+    """Upload one file via Scotty resumable upload. Returns the file reference."""
+    if not data:
+        raise ValueError("empty file data")
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise ValueError(f"file too large: {len(data)} bytes (max {MAX_UPLOAD_BYTES})")
+    mime_type = mime_type or guess_mime(filename)
+    filename = filename or guess_filename(mime_type)
+
+    tokens = _cached_page_tokens()
+    push_id = tokens.get("push_id") or DEFAULT_PUSH_ID
+    pctx = tokens.get("pctx") or DEFAULT_PCTX
+    cookie_str, sapisid = load_cookie()
+
+    common = {
         "Push-ID": push_id,
         "X-Tenant-Id": "bard-storage",
         "X-Client-Pctx": pctx,
-        "X-Goog-Upload-Header-Content-Length": str(len(image_bytes)),
-        "X-Goog-Upload-Header-Content-Type": mime_type,
-        "X-Goog-Upload-Protocol": "resumable",
-        "X-Goog-Upload-Command": "start",
-        "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://gemini.google.com/",
+        "User-Agent": UA,
     }
     if cookie_str:
-        start_headers["Cookie"] = cookie_str
+        common["Cookie"] = cookie_str
     if sapisid:
-        start_headers["Authorization"] = make_sapisidhash(sapisid)
+        common["Authorization"] = make_sapisidhash(sapisid)
 
-    start_url = "https://content-push.googleapis.com/upload/"
-    req = urllib.request.Request(start_url, data=b"", headers=start_headers, method="POST")
+    start_headers = dict(common)
+    start_headers.update({
+        # The browser only declares the length here. The mime type travels in
+        # the payload binding, so X-Goog-Upload-Header-Content-Type is not sent.
+        "X-Goog-Upload-Header-Content-Length": str(len(data)),
+        "X-Goog-Upload-Protocol": "resumable",
+        "X-Goog-Upload-Command": "start",
+        "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+    })
+    # The web client posts the file name as the form body of the start request.
+    start_body = urllib.parse.urlencode({"File name: " + filename: ""}).encode()
 
-    if proxy:
-        opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
-            urllib.request.HTTPSHandler(context=ctx)
-        )
-        resp = opener.open(req, timeout=30)
-    else:
-        resp = urllib.request.urlopen(req, context=ctx, timeout=30)
-
-    upload_url = resp.headers.get("X-Goog-Upload-URL") or resp.headers.get("x-goog-upload-url")
+    upload_url = None
+    last_err = None
+    for endpoint in UPLOAD_ENDPOINTS:
+        try:
+            req = urllib.request.Request(endpoint, data=start_body,
+                                         headers=start_headers, method="POST")
+            resp = _open(req, 30)
+            upload_url = (resp.headers.get("X-Goog-Upload-URL")
+                          or resp.headers.get("x-goog-upload-url"))
+            if upload_url:
+                break
+            last_err = RuntimeError("start response had no X-Goog-Upload-URL header")
+        except Exception as e:
+            last_err = e
+            log(f"Upload start failed on {endpoint}: {e}")
     if not upload_url:
-        raise RuntimeError(f"No upload URL in response headers: {dict(resp.headers)}")
+        raise RuntimeError(f"Upload start failed: {last_err}")
 
     log(f"Upload session started: {upload_url[:80]}...")
 
-    # Step 2: Upload file data + finalize
-    upload_headers = {
+    finalize_headers = dict(common)
+    finalize_headers.update({
         "X-Goog-Upload-Command": "upload, finalize",
         "X-Goog-Upload-Offset": "0",
-        "Content-Type": "application/octet-stream",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    }
-
-    req2 = urllib.request.Request(upload_url, data=image_bytes, headers=upload_headers, method="POST")
-    if proxy:
-        resp2 = opener.open(req2, timeout=60)
-    else:
-        resp2 = urllib.request.urlopen(req2, context=ctx, timeout=60)
-
-    file_ref = resp2.read().decode().strip()
-    if not file_ref or not file_ref.startswith("/"):
-        raise RuntimeError(f"Invalid file reference: {file_ref[:100]}")
-
-    log(f"Image uploaded: {filename} -> {file_ref[:50]}...")
+        "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
+    })
+    req2 = urllib.request.Request(upload_url, data=data,
+                                  headers=finalize_headers, method="POST")
+    file_ref = _open(req2, 120).read().decode("utf-8", errors="replace").strip()
+    if not file_ref.startswith("/"):
+        raise RuntimeError(f"Invalid file reference: {file_ref[:120]}")
+    log(f"Uploaded {filename} ({mime_type}, {len(data)} bytes) -> {file_ref[:48]}...")
     return file_ref
 
 
-def fetch_image_bytes(url: str) -> bytes:
-    """Fetch image from URL."""
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        log(f"Image fetch skipped for unsupported URL scheme: {parsed.scheme or 'none'}")
-        return b""
+def upload_image(image_bytes: bytes, filename: str = "image.png",
+                 mime_type: str = "image/png") -> str:
+    """Backwards-compatible wrapper around upload_file()."""
+    return upload_file(image_bytes, filename, mime_type)
+
+
+def _is_private_ip(hostname: str) -> bool:
+    """Check if hostname resolves to a private/internal IP address."""
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        proxy = CONFIG.get("proxy")
-        if proxy:
-            opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
-                urllib.request.HTTPSHandler(context=_get_ssl_ctx()),
-            )
-            resp = opener.open(req, timeout=30)
-        else:
-            resp = urllib.request.urlopen(req, context=_get_ssl_ctx(), timeout=30)
-        return resp.read()
+        ip = ipaddress.ip_address(hostname)
+        return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+    except ValueError:
+        pass
+    try:
+        ip_str = socket.gethostbyname(hostname)
+        ip = ipaddress.ip_address(ip_str)
+        return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+    except (socket.gaierror, OSError, ValueError):
+        return True
+
+
+def fetch_file_bytes(url: str):
+    """Fetch a remote or data: URL. Returns (bytes, mime).
+
+    Blocks private/internal addresses so a client-supplied URL cannot be used
+    to probe the host network or cloud metadata endpoints (SSRF).
+    """
+    if isinstance(url, str) and url.startswith("data:"):
+        return decode_data_url(url)
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        log(f"File fetch skipped for unsupported URL scheme: {parsed.scheme or 'none'}")
+        return b"", ""
+    hostname = parsed.hostname or parsed.netloc
+    if not hostname or _is_private_ip(hostname):
+        log(f"File fetch blocked: private/internal address {hostname}")
+        return b"", ""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        resp = _open(req, 60)
+        data = resp.read(MAX_UPLOAD_BYTES + 1)
+        mime = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+        return data, mime
     except Exception as e:
-        log(f"Image fetch failed: {e}")
-        return b""
+        log(f"File fetch failed: {e}")
+        return b"", ""
+
+
+def fetch_image_bytes(url: str) -> bytes:
+    """Backwards-compatible wrapper: bytes only."""
+    return fetch_file_bytes(url)[0]
+
+
+def prepare_attachment(item, index: int = 0):
+    """Normalize an attachment into (bytes, filename, mime), or None when unusable.
+
+    Accepted shapes: bytes, url string, (data_or_url, mime) or
+    (data_or_url, mime, filename). Remote URLs are fetched here (with SSRF
+    blocking) and the mime is refined from the file signature when it is a
+    known raster format.
+    """
+    if isinstance(item, (bytes, bytearray)):
+        data, mime, filename = bytes(item), "", ""
+    elif isinstance(item, str):
+        data, mime, filename = item, "", ""
+    elif isinstance(item, (list, tuple)) and item:
+        parts = list(item) + [None] * (3 - len(item))
+        data, mime, filename = parts[0], parts[1] or "", parts[2] or ""
+    else:
+        return None
+    if isinstance(data, str):
+        data, sniffed = fetch_file_bytes(data)
+        mime = mime or sniffed
+    if not data:
+        return None
+    if not mime:
+        mime = guess_mime(filename) if filename else "application/octet-stream"
+    mime = detect_image_mime(data, mime)
+    if not filename:
+        filename = guess_filename(mime, index)
+    return bytes(data), filename, mime
 
 # --- tool calling (from gemini_web2api/) ---
 
@@ -717,30 +954,120 @@ def fetch_image_bytes(url: str) -> bytes:
 
 
 
-MAX_IMAGE_B64_SIZE = 50000  # ~37KB raw image
+
+# Gemini silently truncates very long prompts; keep the tools block bounded.
+PROMPT_MAX_BYTES = 60000
 
 
-def _compress_b64_if_needed(b64: str) -> str:
-    """Compress image if base64 is too large for text embedding."""
-    if len(b64) <= MAX_IMAGE_B64_SIZE:
-        return b64
+def _log(msg: str) -> None:
+    """Log through gemini.log.
+
+    In the package the name comes from a relative import; in the merged single
+    file `log` is a shared global, so try the global first and fall back (the
+    build strips relative import lines, so it must never stand alone as a
+    block body).
+    """
     try:
-        from PIL import Image
-        img_data = base64.b64decode(b64)
-        img = Image.open(io.BytesIO(img_data))
-        # Resize to max 256px on longest side
-        max_dim = 256
-        ratio = min(max_dim / img.width, max_dim / img.height)
-        if ratio < 1:
-            img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
-        # Convert to JPEG with quality reduction
-        buf = io.BytesIO()
-        img.convert("RGB").save(buf, format="JPEG", quality=60)
-        compressed = base64.b64encode(buf.getvalue()).decode()
-        return compressed
+        log(msg)
+    except NameError:
+        try:
+            log(msg)
+        except Exception:
+            pass
     except Exception:
-        # If PIL not available, truncate (model will get partial data)
-        return b64[:MAX_IMAGE_B64_SIZE]
+        pass
+
+
+def _decode_data_url(url: str):
+    """Return (bytes, mime) for a data: URL, or (b"", mime) when undecodable."""
+    header, _sep, payload = url.partition(",")
+    mime = header[5:].split(";")[0].strip() or "application/octet-stream"
+    if ";base64" in header:
+        try:
+            return base64.b64decode(payload), mime
+        except Exception as e:
+            _log(f"Invalid base64 data URL: {e}")
+            return b"", mime
+    return unquote_to_bytes(payload), mime
+
+
+def _attachment_from_url(url, filename: str = ""):
+    """Build a (data_or_url, mime, filename) attachment tuple from a URL."""
+    if isinstance(url, dict):
+        url = url.get("url", "")
+    if not isinstance(url, str) or not url:
+        return None
+    if url.startswith("data:"):
+        data, mime = _decode_data_url(url)
+        if not data:
+            return None
+        return (data, mime, filename or "")
+    if url.startswith("http://") or url.startswith("https://"):
+        name = filename or urllib.parse.urlparse(url).path.rsplit("/", 1)[-1]
+        return (url, "", name)
+    return None
+
+
+def extract_attachment(part: dict):
+    """Extract an attachment from an OpenAI / Responses / Anthropic content part.
+
+    Returns (data_or_url, mime, filename) or None. `data_or_url` is raw bytes for
+    inline payloads, or a URL string that is fetched right before upload.
+    """
+    if not isinstance(part, dict):
+        return None
+    ptype = part.get("type", "")
+    filename = part.get("filename") or part.get("name") or ""
+    if ptype in ("image_url", "image", "input_image"):
+        src = part.get("source")
+        if isinstance(src, dict) and src.get("data"):  # Anthropic style
+            mime = src.get("media_type") or "image/png"
+            try:
+                return (base64.b64decode(src["data"]), mime, filename)
+            except Exception:
+                return None
+        url = part.get("image_url") or part.get("url") or part.get("image") or ""
+        if not url and isinstance(src, dict):
+            url = src.get("url", "")
+        att = _attachment_from_url(url, filename)
+        if att:
+            return att
+        raw = part.get("data") or part.get("base64")
+        if isinstance(raw, str) and raw:
+            if raw.startswith("data:"):
+                data, mime = _decode_data_url(raw)
+                return (data, mime, filename) if data else None
+            try:
+                mime = (part.get("mime_type") or part.get("media_type")
+                        or mimetypes.guess_type(filename or "")[0] or "image/png")
+                return (base64.b64decode(raw, validate=True), mime, filename)
+            except (ValueError, TypeError, binascii.Error):
+                return None
+        return None
+    if ptype in ("file", "input_file", "document"):
+        f = part.get("file") if isinstance(part.get("file"), dict) else part
+        filename = f.get("filename") or f.get("name") or filename
+        src = f.get("source")
+        if isinstance(src, dict) and src.get("data"):
+            mime = src.get("media_type") or "application/octet-stream"
+            try:
+                return (base64.b64decode(src["data"]), mime, filename)
+            except Exception:
+                return None
+        raw = f.get("file_data") or f.get("data") or ""
+        if isinstance(raw, str) and raw and not raw.startswith(("data:", "http://", "https://")):
+            # Raw base64 payload (OpenAI Responses / Anthropic style)
+            mime = (f.get("media_type") or mimetypes.guess_type(filename or "")[0]
+                    or "application/octet-stream")
+            try:
+                return (base64.b64decode(raw), mime, filename)
+            except Exception:
+                return None
+        url = raw or f.get("file_url") or f.get("url") or ""
+        if not url and isinstance(src, dict):
+            url = src.get("url", "")
+        return _attachment_from_url(url, filename)
+    return None
 
 
 def _build_tool_choice_instruction(tool_choice, tool_defs: list) -> str:
@@ -763,58 +1090,12 @@ def _build_tool_choice_instruction(tool_choice, tool_defs: list) -> str:
     return ""
 
 
-def _decode_data_url(url: str):
-    match = re.match(r"^data:([^;,]+)?(;base64)?,(.*)$", url, re.DOTALL)
-    if not match:
-        return None
-    mime = match.group(1) or "image/png"
-    is_base64 = bool(match.group(2))
-    data = match.group(3)
-    try:
-        if is_base64:
-            return base64.b64decode(data, validate=True), mime
-        return unquote_to_bytes(data), mime
-    except (ValueError, TypeError, binascii.Error):
-        return None
-
-
-def _image_from_url(url: str, mime: str = None):
-    if not isinstance(url, str) or not url:
-        return None
-    if url.startswith("data:"):
-        return _decode_data_url(url)
-    return url, mime or "image/png"
-
-
-def _image_from_part(part: dict):
-    part_type = part.get("type")
-    if part_type == "image_url":
-        image_url = part.get("image_url", {})
-        if isinstance(image_url, dict):
-            return _image_from_url(image_url.get("url"), image_url.get("mime_type"))
-        return _image_from_url(image_url)
-    if part_type in ("input_image", "image"):
-        image_url = part.get("image_url") or part.get("url")
-        if isinstance(image_url, dict):
-            return _image_from_url(image_url.get("url"), image_url.get("mime_type"))
-        if image_url:
-            return _image_from_url(image_url, part.get("mime_type"))
-        image_data = part.get("data") or part.get("base64")
-        if isinstance(image_data, str):
-            mime = part.get("mime_type") or part.get("media_type") or "image/png"
-            if image_data.startswith("data:"):
-                return _decode_data_url(image_data)
-            try:
-                return base64.b64decode(image_data, validate=True), mime
-            except (ValueError, TypeError, binascii.Error):
-                return None
-    return None
-
-
 def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> tuple:
-    """Convert OpenAI messages to (prompt_str, images_list).
+    """Convert OpenAI messages to (prompt_str, attachments_list).
 
-    Returns (prompt, images) where images is a list of (bytes, mime_type) tuples.
+    Returns (prompt, attachments) where attachments is a list of
+    (data_or_url, mime, filename) tuples; data_or_url is raw bytes for inline
+    payloads or a URL string fetched right before upload.
     """
     parts = []
     images = []
@@ -829,13 +1110,21 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
                 "parameters": fn.get("parameters", tool.get("parameters", {})),
             })
         if tool_defs:
+            tools_json = json.dumps(tool_defs, indent=2)
+            # Large tool lists silently blow the prompt budget: keep names and
+            # descriptions but drop JSON schemas instead of truncating the prompt.
+            if len(tools_json) > PROMPT_MAX_BYTES // 2:
+                slim = [{"name": t.get("name", ""), "description": t.get("description", "")}
+                        for t in tool_defs]
+                tools_json = json.dumps(slim, indent=2)
+                _log(f"Tools block too large ({len(tool_defs)} tools), stripped parameters")
             constraint = _build_tool_choice_instruction(tool_choice, tool_defs)
             parts.append(
                 "# Tool Use\n\n"
                 "You can call the following tools. Call format:\n"
                 '```tool_call\n{"name": "func_name", "arguments": {...}}\n```\n'
                 "When calling tools, output ONLY the tool_call block(s).\n\n"
-                f"Available tools:\n{json.dumps(tool_defs, indent=2)}"
+                f"Available tools:\n{tools_json}"
                 f"{constraint}"
             )
 
@@ -846,14 +1135,25 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
         if isinstance(content, list):
             text_parts = []
             for c in content:
-                if c.get("type") in ("text", "input_text"):
+                if isinstance(c, str):
+                    text_parts.append(c)
+                    continue
+                if not isinstance(c, dict):
+                    continue
+                if c.get("type") in ("text", "input_text", "output_text"):
                     text_parts.append(c.get("text", ""))
-                else:
-                    image = _image_from_part(c)
-                    if image:
-                        images.append(image)
+                    continue
+                att = extract_attachment(c)
+                if att:
+                    images.append(att)
+                    # URL attachments have no mime yet; guess from the filename
+                    # so image URLs still get the image marker.
+                    mime = att[1] or mimetypes.guess_type(att[2] or "")[0] or ""
+                    if mime.startswith("image/"):
                         text_parts.append("[Image attached]")
-            content = " ".join(text_parts)
+                    else:
+                        text_parts.append(f"[Attached file: {att[2] or 'attachment'}]")
+            content = " ".join(p for p in text_parts if p)
 
         if role == "system":
             parts.append(f"[System instruction]: {content}")
@@ -910,6 +1210,11 @@ def parse_tool_calls(text: str) -> tuple:
 def build_tool_prompt(tool_defs: list) -> str:
     """Build natural tool-use prompt for Gemini Web that avoids prompt-injection detection."""
     tool_spec = json.dumps(tool_defs, indent=2, ensure_ascii=False)
+    if len(tool_spec) > PROMPT_MAX_BYTES // 2:
+        slim = [{"name": t.get("name", ""), "description": t.get("description", "")}
+                for t in tool_defs]
+        tool_spec = json.dumps(slim, indent=2, ensure_ascii=False)
+        _log(f"Tools block too large ({len(tool_defs)} tools), stripped parameters")
     return (
         "# Tool Use\n\n"
         "You can call the following tools to help accomplish tasks. "
@@ -944,9 +1249,11 @@ def _google_tool_choice_instruction(req: dict) -> str:
 
 
 def google_contents_to_prompt(req: dict) -> tuple:
-    """Convert Google API contents/tools/systemInstruction to (prompt_str, images_list).
+    """Convert Google API contents/tools/systemInstruction to (prompt_str, attachments_list).
 
-    Returns (prompt, images) where images is a list of (bytes, mime_type) tuples.
+    Returns (prompt, attachments) where attachments is a list of
+    (data_or_url, mime, filename) tuples; data_or_url is raw bytes for inline
+    payloads or a URL string fetched right before upload.
     """
     parts = []
     images = []
@@ -987,14 +1294,29 @@ def google_contents_to_prompt(req: dict) -> tuple:
                 msg_parts.append(p["text"])
             elif p.get("inlineData"):
                 data = p["inlineData"]
+                mime = data.get("mimeType") or "application/octet-stream"
+                name = data.get("displayName") or data.get("fileName") or ""
                 try:
-                    images.append((
-                        base64.b64decode(data["data"], validate=True),
-                        data.get("mimeType", "image/png"),
-                    ))
-                    msg_parts.append("[Image attached]")
-                except (KeyError, ValueError, TypeError, binascii.Error):
-                    pass
+                    raw = base64.b64decode(data.get("data", ""), validate=True)
+                    if not raw:
+                        raise ValueError("empty inlineData payload")
+                    images.append((raw, mime, name))
+                    if mime.startswith("image/"):
+                        msg_parts.append("[Image attached]")
+                    else:
+                        msg_parts.append(f"[Attached file: {name or mime}]")
+                except Exception as e:
+                    _log(f"Invalid inlineData payload: {e}")
+            elif p.get("fileData"):
+                fd = p["fileData"]
+                uri = fd.get("fileUri") or fd.get("file_uri") or ""
+                att = _attachment_from_url(uri, fd.get("displayName", ""))
+                if att:
+                    images.append(att)
+                    if not (fd.get("mimeType") or "").startswith("image/"):
+                        msg_parts.append(f"[Attached file: {att[2] or uri}]")
+                    else:
+                        msg_parts.append("[Image attached]")
             elif p.get("functionCall"):
                 fc = p["functionCall"]
                 msg_parts.append(
@@ -1064,33 +1386,59 @@ def parse_google_function_calls(text: str) -> tuple:
 
 
 
+
 def _usage(prompt: str, text: str) -> dict:
     p = len(prompt) // 4
     c = len(text or "") // 4
     return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}
 
 
-def _upload_images(images: list) -> list:
-    """Upload images and return list of file references. Returns None if no images."""
-    if not images:
+def _upload_attachments(attachments: list) -> list:
+    """Upload images/files, returning [(file_ref, filename, mime), ...] or None.
+
+    Accepts the (data_or_url, mime, filename) tuples produced by the prompt
+    converters; remote URLs are fetched and data: URLs decoded before upload.
+    Several attachments are uploaded concurrently, the way the web client fires
+    its start requests; the result keeps attachment order because Gemini reads
+    the payload bindings in that order. Failed attachments are skipped, but when
+    every attachment fails a RuntimeError is raised so the caller can return a
+    502 instead of silently generating without the files the user sent.
+    """
+    if not attachments:
         return None
-    file_refs = []
-    for item in images:
-        if not (isinstance(item, tuple) and len(item) == 2):
-            continue
-        data, mime = item
-        if isinstance(data, str):
-            data = fetch_image_bytes(data)
-            mime = mime or "image/png"
-        if not data:
-            raise RuntimeError("image fetch failed")
-        mime = detect_image_mime(data, mime or "image/png")
+    if not load_cookie()[0]:
+        log("Attachments without GEMINI_COOKIE: Gemini only accepts files on a signed-in session")
+    errors = []
+
+    def run(pair):
+        index, item = pair
         try:
-            ref = upload_image(data, "image.png", mime or "image/png")
-            file_refs.append(ref)
+            prepared = prepare_attachment(item, index)
+            if not prepared:
+                errors.append(f"attachment {index + 1}: unusable input")
+                return None
+            data, filename, mime = prepared
+            return (upload_file(data, filename, mime), filename, mime)
         except Exception as e:
-            raise RuntimeError(f"image upload failed: {e}") from e
-    return file_refs if file_refs else None
+            errors.append(f"attachment {index + 1}: {e}")
+            return None
+
+    if len(attachments) == 1:
+        results = [run((0, attachments[0]))]
+    else:
+        # Warm the shared token cache once so the workers do not all scrape the app page.
+        _cached_page_tokens()
+        with ThreadPoolExecutor(max_workers=min(4, len(attachments))) as pool:
+            results = list(pool.map(run, enumerate(attachments)))
+
+    file_refs = [r for r in results if r]
+    if not file_refs:
+        raise RuntimeError("attachment upload failed: " + "; ".join(errors))
+    return file_refs
+
+
+# Backwards-compatible alias for the previous image-only helper name.
+_upload_images = _upload_attachments
 
 
 class GeminiHandler(BaseHTTPRequestHandler):
@@ -1190,7 +1538,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     for n, c in MODELS.items()
                 ]})
             elif self.path == "/":
-                self.send_json({"status": "ok", "version": __version__, "models": list(MODELS.keys())})
+                self.send_json({"status": "ok", "version": __version__, "models": list(MODELS.keys()),
+                                "cookie": bool(load_cookie()[0])})
             else:
                 self.send_json({"error": "not found"}, 404)
         except (BrokenPipeError, ConnectionResetError):
@@ -1244,7 +1593,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         stream = req.get("stream", False)
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         try:
-            file_refs = _upload_images(images)
+            file_refs = _upload_attachments(images)
         except RuntimeError as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -1374,7 +1723,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            file_refs = _upload_images(images)
+            file_refs = _upload_attachments(images)
             text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
@@ -1558,7 +1907,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            file_refs = _upload_images(images)
+            file_refs = _upload_attachments(images)
         except RuntimeError as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return

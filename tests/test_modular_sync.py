@@ -7,9 +7,10 @@ from unittest import mock
 from urllib.parse import parse_qs
 
 from gemini_web2api.config import CONFIG, DEFAULT_CONFIG
-from gemini_web2api.gemini import _build_payload
+from gemini_web2api.gemini import _build_payload, _build_file_bindings
 from gemini_web2api.server import GeminiHandler, ThreadedServer
 from gemini_web2api.tools import google_contents_to_prompt, messages_to_prompt
+from gemini_web2api.multimodal import fetch_file_bytes
 
 
 def _decode_payload(payload):
@@ -65,14 +66,31 @@ class PayloadPersistenceTests(unittest.TestCase):
         inner = _decode_payload(_build_payload("describe", 1, 4, ["/uploaded/image-ref"]))
 
         self.assertEqual(inner[0][0], "describe")
-        self.assertEqual(inner[0][3], [[None, None, "/uploaded/image-ref"]])
+        # Capture-verified binding: [[[ref, kind, None, mime], filename], ...]
+        self.assertEqual(
+            inner[0][3],
+            [[["/uploaded/image-ref", 3, None, "application/octet-stream"], "file_0"]],
+        )
+
+    def test_file_bindings_use_kind_1_for_images_and_3_for_files(self):
+        refs = [
+            ("/ref/img.png", "img.png", "image/png"),
+            ("/ref/doc.pdf", "doc.pdf", "application/pdf"),
+        ]
+
+        bindings = _build_file_bindings(refs)
+
+        self.assertEqual(bindings, [
+            [["/ref/img.png", 1, None, "image/png"], "img.png"],
+            [["/ref/doc.pdf", 3, None, "application/pdf"], "doc.pdf"],
+        ])
 
 
 class MessageParsingTests(unittest.TestCase):
     def test_messages_to_prompt_extracts_openai_image_url_data_url(self):
         image_data = base64.b64encode(b"fake png").decode()
 
-        prompt, images = messages_to_prompt([{
+        prompt, attachments = messages_to_prompt([{
             "role": "user",
             "content": [
                 {"type": "text", "text": "Describe"},
@@ -81,10 +99,10 @@ class MessageParsingTests(unittest.TestCase):
         }])
 
         self.assertEqual(prompt, "Describe [Image attached]")
-        self.assertEqual(images, [(b"fake png", "image/png")])
+        self.assertEqual(attachments, [(b"fake png", "image/png", "")])
 
     def test_messages_to_prompt_extracts_responses_input_image_url(self):
-        prompt, images = messages_to_prompt([{
+        prompt, attachments = messages_to_prompt([{
             "role": "user",
             "content": [
                 {"type": "input_text", "text": "Describe"},
@@ -93,10 +111,61 @@ class MessageParsingTests(unittest.TestCase):
         }])
 
         self.assertEqual(prompt, "Describe [Image attached]")
-        self.assertEqual(images, [("https://example.com/image.png", "image/png")])
+        self.assertEqual(attachments, [("https://example.com/image.png", "", "image.png")])
+
+    def test_messages_to_prompt_extracts_input_file_pdf(self):
+        pdf_data = base64.b64encode(b"%PDF-fake").decode()
+
+        prompt, attachments = messages_to_prompt([{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "Summarize"},
+                {"type": "input_file", "filename": "notes.pdf",
+                 "file_data": f"data:application/pdf;base64,{pdf_data}"},
+            ],
+        }])
+
+        self.assertEqual(prompt, "Summarize [Attached file: notes.pdf]")
+        self.assertEqual(attachments, [(b"%PDF-fake", "application/pdf", "notes.pdf")])
+
+    def test_messages_to_prompt_extracts_chat_file_part(self):
+        pdf_data = base64.b64encode(b"%PDF-fake").decode()
+
+        _, attachments = messages_to_prompt([{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What is this?"},
+                {"type": "file",
+                 "file": {"filename": "doc.pdf", "file_data": f"data:application/pdf;base64,{pdf_data}"}},
+            ],
+        }])
+
+        self.assertEqual(attachments, [(b"%PDF-fake", "application/pdf", "doc.pdf")])
+
+    def test_messages_to_prompt_extracts_anthropic_source_image(self):
+        image_data = base64.b64encode(b"fake jpeg").decode()
+
+        _, attachments = messages_to_prompt([{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                                             "data": image_data}},
+            ],
+        }])
+
+        self.assertEqual(attachments, [(b"fake jpeg", "image/jpeg", "")])
+
+    def test_messages_to_prompt_tolerates_string_and_non_dict_parts(self):
+        prompt, attachments = messages_to_prompt([{
+            "role": "user",
+            "content": ["hello", {"type": "text", "text": "world"}, 42, None],
+        }])
+
+        self.assertEqual(prompt, "hello world")
+        self.assertEqual(attachments, [])
 
     def test_messages_to_prompt_ignores_malformed_image_data_url(self):
-        prompt, images = messages_to_prompt([{
+        prompt, attachments = messages_to_prompt([{
             "role": "user",
             "content": [
                 {"type": "text", "text": "Describe"},
@@ -105,12 +174,12 @@ class MessageParsingTests(unittest.TestCase):
         }])
 
         self.assertEqual(prompt, "Describe")
-        self.assertEqual(images, [])
+        self.assertEqual(attachments, [])
 
     def test_google_contents_to_prompt_extracts_inline_image_data(self):
         image_data = base64.b64encode(b"fake png").decode()
 
-        prompt, images = google_contents_to_prompt({
+        prompt, attachments = google_contents_to_prompt({
             "contents": [{
                 "role": "user",
                 "parts": [
@@ -121,10 +190,41 @@ class MessageParsingTests(unittest.TestCase):
         })
 
         self.assertEqual(prompt, "Describe\n[Image attached]")
-        self.assertEqual(images, [(b"fake png", "image/png")])
+        self.assertEqual(attachments, [(b"fake png", "image/png", "")])
+
+    def test_google_contents_to_prompt_extracts_inline_pdf_data(self):
+        pdf_data = base64.b64encode(b"%PDF-fake").decode()
+
+        prompt, attachments = google_contents_to_prompt({
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    {"text": "Summarize"},
+                    {"inlineData": {"mimeType": "application/pdf", "data": pdf_data,
+                                    "displayName": "report.pdf"}},
+                ],
+            }],
+        })
+
+        self.assertEqual(prompt, "Summarize\n[Attached file: report.pdf]")
+        self.assertEqual(attachments, [(b"%PDF-fake", "application/pdf", "report.pdf")])
+
+    def test_google_contents_to_prompt_extracts_file_data_uri(self):
+        prompt, attachments = google_contents_to_prompt({
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    {"text": "Describe"},
+                    {"fileData": {"mimeType": "image/png", "fileUri": "https://example.com/a.png"}},
+                ],
+            }],
+        })
+
+        self.assertEqual(prompt, "Describe\n[Image attached]")
+        self.assertEqual(attachments, [("https://example.com/a.png", "", "a.png")])
 
     def test_google_contents_to_prompt_ignores_malformed_inline_image_data(self):
-        prompt, images = google_contents_to_prompt({
+        prompt, attachments = google_contents_to_prompt({
             "contents": [{
                 "role": "user",
                 "parts": [
@@ -135,7 +235,21 @@ class MessageParsingTests(unittest.TestCase):
         })
 
         self.assertEqual(prompt, "Describe")
-        self.assertEqual(images, [])
+        self.assertEqual(attachments, [])
+
+
+class SsrfProtectionTests(unittest.TestCase):
+    def test_fetch_file_bytes_blocks_loopback(self):
+        self.assertEqual(fetch_file_bytes("http://127.0.0.1:8081/secret"), (b"", ""))
+
+    def test_fetch_file_bytes_blocks_link_local_metadata(self):
+        self.assertEqual(fetch_file_bytes("http://169.254.169.254/latest/meta-data/"), (b"", ""))
+
+    def test_fetch_file_bytes_blocks_private_range(self):
+        self.assertEqual(fetch_file_bytes("http://192.168.1.10/admin"), (b"", ""))
+
+    def test_fetch_file_bytes_blocks_unsupported_scheme(self):
+        self.assertEqual(fetch_file_bytes("file:///etc/passwd"), (b"", ""))
 
 
 class StreamingEndpointTests(unittest.TestCase):
@@ -228,9 +342,9 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["choices"][0]["message"]["content"], "chunked ok")
 
-    @mock.patch("gemini_web2api.server.upload_image", return_value="/uploaded/image-ref")
+    @mock.patch("gemini_web2api.server.upload_file", return_value="/uploaded/image-ref")
     @mock.patch("gemini_web2api.server.generate", return_value="looks good")
-    def test_chat_accepts_openai_image_url_data_url(self, generate, upload_image):
+    def test_chat_accepts_openai_image_url_data_url(self, generate, upload_file):
         image_data = base64.b64encode(b"fake png").decode()
 
         status, _, body = self.post_json(
@@ -253,15 +367,21 @@ class StreamingEndpointTests(unittest.TestCase):
         )
 
         self.assertEqual(status, 200)
-        upload_image.assert_called_once_with(b"fake png", "image.png", "image/png")
-        self.assertEqual(generate.call_args.args[3], ["/uploaded/image-ref"])
+        self.assertEqual(upload_file.call_count, 1)
+        args = upload_file.call_args.args
+        self.assertEqual(args[0], b"fake png")
+        self.assertEqual(args[2], "image/png")
+        self.assertRegex(args[1], r"image_\d+_0\.png")
+        self.assertEqual(generate.call_args.args[3],
+                         [("/uploaded/image-ref", args[1], "image/png")])
         self.assertIn("[Image attached]", generate.call_args.args[0])
         self.assertEqual(json.loads(body)["choices"][0]["message"]["content"], "looks good")
 
-    @mock.patch("gemini_web2api.server.fetch_image_bytes", return_value=b"\xff\xd8\xffremote jpeg")
-    @mock.patch("gemini_web2api.server.upload_image", return_value="/uploaded/remote-ref")
+    @mock.patch("gemini_web2api.multimodal.fetch_file_bytes",
+                return_value=(b"\xff\xd8\xffremote jpeg", "image/jpeg"))
+    @mock.patch("gemini_web2api.server.upload_file", return_value="/uploaded/remote-ref")
     @mock.patch("gemini_web2api.server.generate", return_value="remote ok")
-    def test_responses_accepts_input_image_url(self, generate, upload_image, fetch_image_bytes):
+    def test_responses_accepts_input_image_url(self, generate, upload_file, _fetch):
         status, _, _ = self.post_json(
             "/v1/responses",
             {
@@ -280,14 +400,15 @@ class StreamingEndpointTests(unittest.TestCase):
         )
 
         self.assertEqual(status, 200)
-        fetch_image_bytes.assert_called_once_with("https://example.com/image.jpg")
-        upload_image.assert_called_once_with(b"\xff\xd8\xffremote jpeg", "image.png", "image/jpeg")
-        self.assertEqual(generate.call_args.args[3], ["/uploaded/remote-ref"])
+        upload_file.assert_called_once_with(
+            b"\xff\xd8\xffremote jpeg", "image.jpg", "image/jpeg")
+        self.assertEqual(generate.call_args.args[3],
+                         [("/uploaded/remote-ref", "image.jpg", "image/jpeg")])
         self.assertIn("[Image attached]", generate.call_args.args[0])
 
-    @mock.patch("gemini_web2api.server.upload_image", return_value="/uploaded/image-ref")
+    @mock.patch("gemini_web2api.server.upload_file", return_value="/uploaded/image-ref")
     @mock.patch("gemini_web2api.server.generate", return_value="top-level image ok")
-    def test_responses_accepts_top_level_input_image(self, generate, upload_image):
+    def test_responses_accepts_top_level_input_image(self, generate, upload_file):
         image_data = base64.b64encode(b"fake png").decode()
 
         status, _, _ = self.post_json(
@@ -305,13 +426,68 @@ class StreamingEndpointTests(unittest.TestCase):
         )
 
         self.assertEqual(status, 200)
-        upload_image.assert_called_once_with(b"fake png", "image.png", "image/png")
-        self.assertEqual(generate.call_args.args[3], ["/uploaded/image-ref"])
+        args = upload_file.call_args.args
+        self.assertEqual(args[0], b"fake png")
+        self.assertEqual(args[2], "image/png")
+        self.assertEqual(generate.call_args.args[3],
+                         [("/uploaded/image-ref", args[1], "image/png")])
         self.assertIn("What is shown?", generate.call_args.args[0])
         self.assertIn("[Image attached]", generate.call_args.args[0])
 
-    @mock.patch("gemini_web2api.server.upload_image", side_effect=RuntimeError("upload denied"))
-    def test_google_image_upload_failure_returns_502(self, _upload_image):
+    @mock.patch("gemini_web2api.server.upload_file", return_value="/uploaded/file-ref")
+    @mock.patch("gemini_web2api.server.generate", return_value="pdf ok")
+    def test_chat_accepts_openai_file_part_pdf(self, generate, upload_file):
+        pdf_data = base64.b64encode(b"%PDF-fake").decode()
+
+        status, _, body = self.post_json(
+            "/v1/chat/completions",
+            {
+                "model": "gemini-3.6-flash",
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Summarize this document"},
+                        {"type": "file",
+                         "file": {"filename": "notes.pdf",
+                                  "file_data": f"data:application/pdf;base64,{pdf_data}"}},
+                    ],
+                }],
+            },
+        )
+
+        self.assertEqual(status, 200)
+        upload_file.assert_called_once_with(b"%PDF-fake", "notes.pdf", "application/pdf")
+        self.assertEqual(generate.call_args.args[3],
+                         [("/uploaded/file-ref", "notes.pdf", "application/pdf")])
+        self.assertIn("[Attached file: notes.pdf]", generate.call_args.args[0])
+        self.assertEqual(json.loads(body)["choices"][0]["message"]["content"], "pdf ok")
+
+    @mock.patch("gemini_web2api.multimodal.fetch_file_bytes",
+                return_value=(b"fake png", "image/png"))
+    @mock.patch("gemini_web2api.server.upload_file", return_value="/uploaded/gref")
+    @mock.patch("gemini_web2api.server.generate", return_value="filedata ok")
+    def test_google_file_data_uri_is_fetched_and_uploaded(self, generate, upload_file, _fetch):
+        status, _, _ = self.post_json(
+            "/v1beta/models/gemini-3.6-flash:generateContent",
+            {
+                "contents": [{
+                    "role": "user",
+                    "parts": [
+                        {"text": "Describe"},
+                        {"fileData": {"mimeType": "image/png",
+                                      "fileUri": "https://example.com/a.png"}},
+                    ],
+                }],
+            },
+        )
+
+        self.assertEqual(status, 200)
+        upload_file.assert_called_once_with(b"fake png", "a.png", "image/png")
+        self.assertEqual(generate.call_args.args[3],
+                         [("/uploaded/gref", "a.png", "image/png")])
+
+    @mock.patch("gemini_web2api.server.upload_file", side_effect=RuntimeError("upload denied"))
+    def test_google_image_upload_failure_returns_502(self, _upload_file):
         image_data = base64.b64encode(b"fake png").decode()
 
         status, _, body = self.post_json(
@@ -330,7 +506,40 @@ class StreamingEndpointTests(unittest.TestCase):
         )
 
         self.assertEqual(status, 502)
-        self.assertIn("image upload failed: upload denied", json.loads(body)["error"]["message"])
+        self.assertIn("attachment upload failed", json.loads(body)["error"]["message"])
+        self.assertIn("upload denied", json.loads(body)["error"]["message"])
+
+    @mock.patch("gemini_web2api.server.generate", return_value="partial ok")
+    def test_chat_continues_when_only_some_attachments_fail(self, generate):
+        def fake_upload(data, filename, mime):
+            if data == b"bad":
+                raise RuntimeError("denied")
+            return "/ok-ref"
+
+        bad = base64.b64encode(b"bad").decode()
+        good = base64.b64encode(b"good").decode()
+
+        with mock.patch("gemini_web2api.server.upload_file", side_effect=fake_upload):
+            status, _, body = self.post_json(
+                "/v1/chat/completions",
+                {
+                    "model": "gemini-3.6-flash",
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Describe"},
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{bad}"}},
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{good}"}},
+                        ],
+                    }],
+                },
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["choices"][0]["message"]["content"], "partial ok")
+        refs = generate.call_args.args[3]
+        self.assertEqual(len(refs), 1)
+        self.assertEqual(refs[0][0], "/ok-ref")
 
     @mock.patch("gemini_web2api.server.generate_stream", return_value=iter(["streamed"]))
     def test_google_stream_generate_content_uses_sse(self, _generate_stream):

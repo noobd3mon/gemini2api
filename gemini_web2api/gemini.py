@@ -4,10 +4,12 @@ import time
 import uuid
 import re
 import urllib.request
+import urllib.error
 import urllib.parse
 import ssl
 import os
 import hashlib
+import mimetypes
 
 try:
     import httpx
@@ -98,6 +100,28 @@ def _account_prefix() -> str:
     return f"/u/{auth_user}"
 
 
+def _page_token(name: str):
+    """Read a scraped Gemini app-page token (push_id/pctx/at/f_sid).
+
+    The tokens live in multimodal._cached_page_tokens(). In the package the
+    name comes from a relative import; in the merged single file it is a
+    shared global, so try the global first and fall back (the build strips
+    relative import lines, so it must never stand alone as a block body).
+    The cache is warmed by the upload step, so this is a cache hit for
+    attachment requests and costs nothing (no fetch) for text-only ones.
+    """
+    try:
+        return _cached_page_tokens().get(name)
+    except NameError:
+        try:
+            from .multimodal import _cached_page_tokens
+            return _cached_page_tokens().get(name)
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
 def _build_headers() -> dict:
     account_prefix = _account_prefix()
     headers = {
@@ -117,6 +141,34 @@ def _build_headers() -> dict:
     return headers
 
 
+def _build_file_bindings(file_refs: list) -> list:
+    """Bind uploaded files into payload slot inner[0][3].
+
+    Verified against real gemini.google.com captures (2026-08-11):
+        [[[<file_ref>, <kind>, None, <mime>], <filename>], ...]
+    <kind> is 1 for images and 3 for any other file type: a 3-file capture sent
+    1 for image/png and image/jpeg, but 3 for text/plain.
+    Accepts bare refs or (ref, filename, mime) tuples.
+    """
+    if not file_refs:
+        return None
+    bindings = []
+    for i, item in enumerate(file_refs):
+        if isinstance(item, (list, tuple)):
+            parts = list(item) + [None] * (3 - len(item))
+            ref, filename, mime = parts[0], parts[1], parts[2]
+        else:
+            ref, filename, mime = item, None, None
+        if not ref:
+            continue
+        if not mime and filename:
+            mime = mimetypes.guess_type(filename)[0]
+        mime = mime or "application/octet-stream"
+        kind = 1 if mime.startswith("image/") else 3
+        bindings.append([[ref, kind, None, mime], filename or f"file_{i}"])
+    return bindings or None
+
+
 def _apply_chat_persistence_flags(inner: list) -> None:
     """Apply Gemini Web persistence flags to an outgoing request payload."""
     if CONFIG.get("temporary_chats", False):
@@ -129,11 +181,7 @@ def _apply_chat_persistence_flags(inner: list) -> None:
 
 def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
     inner = [None] * 102
-    if file_refs:
-        refs = [[None, None, ref] for ref in file_refs]
-        inner[0] = [prompt, 0, None, refs, None, None, 0]
-    else:
-        inner[0] = [prompt, 0, None, None, None, None, 0]
+    inner[0] = [prompt, 0, None, _build_file_bindings(file_refs), None, None, 0]
     inner[1] = ["en"]
     inner[2] = ["", "", "", None, None, None, None, None, None, ""]
     inner[6] = [0]
@@ -157,17 +205,31 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
     params = {"f.req": json.dumps(outer)}
     if CONFIG.get("xsrf_token"):
         params["at"] = CONFIG["xsrf_token"]
+    elif file_refs:
+        # The browser always sends an `at` XSRF token; use the one scraped from
+        # the app page (already cached by the upload step). Text-only requests
+        # are tolerated without it, so only attach it for file-bearing calls.
+        at = _page_token("at")
+        if at:
+            params["at"] = at
     return urllib.parse.urlencode(params)
 
 
-def _get_url() -> str:
+def _get_url(file_refs: list = None) -> str:
     reqid = int(time.time()) % 1000000
     account_prefix = _account_prefix()
-    return (
+    url = (
         f"https://gemini.google.com{account_prefix}/_/BardChatUi/data/"
         "assistant.lamda.BardFrontendService/StreamGenerate"
         f"?bl={CONFIG['gemini_bl']}&hl=en&_reqid={reqid}&rt=c"
     )
+    # The browser always sends f.sid; only attach it for file-bearing calls so
+    # text-only requests stay cheap (no page scrape needed).
+    if file_refs:
+        fsid = _page_token("f_sid")
+        if fsid:
+            url += f"&f.sid={fsid}"
+    return url
 
 
 def clean_text(text: str, strip: bool = True) -> str:
@@ -202,23 +264,49 @@ def _extract_texts_from_line(line: str) -> list:
         return []
 
 
+class GeminiUpstreamError(RuntimeError):
+    """Gemini refused the request itself; resending the same payload will not help."""
+
+
+# Real responses look like `...BardErrorInfo",[1100]]]`, so allow the quote/comma.
+BARD_ERROR_RE = re.compile(r'BardErrorInfo\D{0,8}\[\s*(\d+)')
+
+
+def bard_error_message(raw: str) -> str:
+    """Describe a BardErrorInfo code, with a hint for the common attachment failure."""
+    match = BARD_ERROR_RE.search(raw)
+    if not match:
+        return ""
+    code = match.group(1)
+    msg = f"Gemini upstream rejected request: BardErrorInfo [{code}]"
+    if code == "1100":
+        if load_cookie()[0]:
+            msg += (" - the attachment was refused. The cookie is most likely expired"
+                    " or has no file access; refresh GEMINI_COOKIE and retry.")
+        else:
+            msg += (" - file/image input needs a signed-in session. Set GEMINI_COOKIE;"
+                    " anonymous requests can only send text.")
+    return msg
+
+
 def extract_response_text(raw: str) -> str:
     """Parse full response to get final text."""
-    bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', raw)
-    if bard_err:
-        raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]")
     last_text = ""
     for line in raw.split("\n"):
         for t in _extract_texts_from_line(line):
             if len(t) > len(last_text):
                 last_text = t
+    if not last_text:
+        err = bard_error_message(raw)
+        if err:
+            raise GeminiUpstreamError(err)
     return clean_text(last_text)
 
 
 def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
     """Non-streaming generation with retry."""
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
-    url = _get_url()
+    url = _get_url(file_refs)
     headers = _build_headers()
     ctx = _get_ssl_ctx()
     proxy = CONFIG.get("proxy")
@@ -237,6 +325,24 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
             raw = resp.read().decode("utf-8", errors="replace")
             return extract_response_text(raw)
+        except GeminiUpstreamError:
+            raise  # Gemini refused the payload; retrying only wastes time.
+        except urllib.error.HTTPError as e:
+            # 4xx (other than 405) is a permanent rejection - surface Gemini's
+            # body so the cause can be diagnosed instead of silently retrying.
+            if 400 <= e.code < 500 and e.code != 405:
+                snippet = ""
+                try:
+                    snippet = e.read().decode("utf-8", errors="replace")[:400]
+                except Exception:
+                    pass
+                raise GeminiUpstreamError(
+                    f"StreamGenerate HTTP {e.code} {e.reason}"
+                    + (f": {snippet}" if snippet else ""))
+            last_err = e
+            if attempt < CONFIG["retry_attempts"] - 1:
+                log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
+                time.sleep(CONFIG["retry_delay_sec"])
         except Exception as e:
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:
@@ -254,7 +360,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
         return
 
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
-    url = _get_url()
+    url = _get_url(file_refs)
     headers = _build_headers()
     client = _get_httpx_client()
 
@@ -267,12 +373,10 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                 buf = ""
                 for chunk in resp.iter_text():
                     buf += chunk
-                    if "BardErrorInfo" in buf:
-                        bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', buf)
-                        if bard_err:
-                            raise RuntimeError(
-                                f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]"
-                            )
+                    if "BardErrorInfo" in buf and not emitted_raw_text:
+                        err = bard_error_message(buf)
+                        if err:
+                            raise GeminiUpstreamError(err)
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
                         for t in _extract_texts_from_line(line):
@@ -285,6 +389,23 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                             if delta:
                                 yield delta
             return
+        except GeminiUpstreamError:
+            raise  # Gemini refused the payload; retrying only wastes time.
+        except httpx.HTTPStatusError as e:
+            code = e.response.status_code
+            if 400 <= code < 500 and code != 405:
+                snippet = ""
+                try:
+                    snippet = e.response.read().decode("utf-8", errors="replace")[:400]
+                except Exception:
+                    pass
+                raise GeminiUpstreamError(
+                    f"StreamGenerate HTTP {code}"
+                    + (f": {snippet}" if snippet else ""))
+            last_err = e
+            if attempt < CONFIG["retry_attempts"] - 1:
+                log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
+                time.sleep(CONFIG["retry_delay_sec"])
         except Exception as e:
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:
