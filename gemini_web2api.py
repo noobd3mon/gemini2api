@@ -566,7 +566,15 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
             else:
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
             raw = resp.read().decode("utf-8", errors="replace")
-            return extract_response_text(raw)
+            text = extract_response_text(raw)
+            if text:
+                return text
+            # Upstream answered 200 with no text: treat as transient and retry
+            # instead of returning an empty completion to the client.
+            last_err = RuntimeError("upstream returned an empty completion")
+            if attempt < CONFIG["retry_attempts"] - 1:
+                log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {last_err}")
+                time.sleep(CONFIG["retry_delay_sec"])
         except GeminiUpstreamError:
             raise  # Gemini refused the payload; retrying only wastes time.
         except urllib.error.HTTPError as e:
@@ -630,7 +638,11 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                             emitted_raw_text = t
                             if delta:
                                 yield delta
-            return
+            if emitted_raw_text:
+                return
+            # Upstream answered 200 with an empty stream: retry instead of
+            # silently ending the SSE with no content.
+            last_err = RuntimeError("upstream returned an empty stream")
         except GeminiUpstreamError:
             raise  # Gemini refused the payload; retrying only wastes time.
         except httpx.HTTPStatusError as e:

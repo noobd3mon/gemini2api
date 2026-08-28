@@ -650,5 +650,53 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(events[-1][1]["response"]["output"][0]["name"], "get_weather")
 
 
+class EmptyResponseRetryTests(unittest.TestCase):
+    """An upstream 200 with no text must be retried, not returned as empty."""
+
+    def setUp(self):
+        self.original_config = dict(CONFIG)
+        CONFIG["retry_attempts"] = 3
+        CONFIG["retry_delay_sec"] = 0
+        CONFIG["log_requests"] = False
+
+    def tearDown(self):
+        CONFIG.clear()
+        CONFIG.update(self.original_config)
+
+    @staticmethod
+    def _upstream_body(text):
+        # A minimal wrb.fr line; needs >= 200 chars to be parsed.
+        inner = json.dumps([None, None, None, None, [[None, [text]]]])
+        return json.dumps([["wrb.fr", None, inner]]).encode()
+
+    class _FakeResp:
+        def __init__(self, body=b"   "):
+            self._body = body
+
+        def read(self):
+            return self._body
+
+    @mock.patch("gemini_web2api.gemini.urllib.request.urlopen")
+    def test_generate_retries_on_empty_completion(self, urlopen):
+        from gemini_web2api.gemini import generate
+
+        bodies = [b"   ", self._upstream_body("x" * 250)]
+        urlopen.side_effect = lambda *a, **k: self._FakeResp(bodies.pop(0))
+
+        self.assertEqual(generate("hi", 1, 4), "x" * 250)
+        self.assertEqual(urlopen.call_count, 2)
+
+    @mock.patch("gemini_web2api.gemini.urllib.request.urlopen")
+    def test_generate_raises_after_all_empty_completions(self, urlopen):
+        from gemini_web2api.gemini import generate
+
+        CONFIG["retry_attempts"] = 2
+        urlopen.side_effect = lambda *a, **k: self._FakeResp()
+
+        with self.assertRaises(RuntimeError) as ctx:
+            generate("hi", 1, 4)
+        self.assertIn("empty completion", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
